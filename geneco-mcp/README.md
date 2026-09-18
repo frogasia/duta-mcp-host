@@ -21,16 +21,28 @@ encrypted at rest (`app/security/crypto.py`); every `tools/call` (stage 2)
 resolves the tenant's stored credentials for whichever connector that tool
 needs and talks to the backend directly.
 
-For D365 the stored credential is the tenant's **Key Vault** app
-registration, not its D365 one: the real D365 app registration
-(`Crm-Client-Id`/`Crm-Client-Secret`) is fetched from that vault on the
-tenant's first call and cached in memory for 15 minutes
-(`app/store/crm_resolver.py`), so the D365 secret is never at rest here.
-The fetch is lazy rather than at startup — a tenant registered after boot
-works without a restart, a vault outage degrades only the tenant being
-called, and a rotated secret is picked up within the TTL (immediately, if
-the credentials are re-registered). The custom API stores Basic Auth
-credentials directly, since it has no vault.
+For D365 a tenant registers in one of two modes, chosen by `auth_mode`:
+
+- **`key_vault`** (the default, and the one to prefer) — the stored
+  credential is the tenant's **Key Vault** app registration, not its D365
+  one. The real D365 app registration
+  (`Crm-Client-Id`/`Crm-Client-Secret`) is fetched from that vault on the
+  tenant's first call and cached in memory for 15 minutes
+  (`app/store/crm_resolver.py`), so the D365 secret is never at rest here.
+  The fetch is lazy rather than at startup — a tenant registered after
+  boot works without a restart, a vault outage degrades only the tenant
+  being called, and a rotated secret is picked up within the TTL
+  (immediately, if the credentials are re-registered).
+- **`direct`** — the tenant has no vault, so the `client_id`/
+  `client_secret` registered *are* the D365 app registration. There is no
+  vault hop and nothing to cache. This does put a D365 secret at rest here
+  (encrypted), which the vault indirection exists to avoid; it is the
+  price of onboarding a tenant that cannot provide a vault.
+
+A tenant is in exactly one mode — one row, one credential pair — so
+re-registering in the other mode clears the first one's columns. The
+custom API stores Basic Auth credentials directly either way, since it has
+no vault.
 
 ## Base URL — read this first
 
@@ -74,8 +86,8 @@ error convention, and how the pieces fit together.
 one pair of endpoints per connector kind:
 
 ```
-POST   /{tenant_slug}/credentials   # register/replace a tenant's D365 credentials
-GET    /{tenant_slug}/credentials   # confirm what's registered (kv_client_secret always masked)
+POST   /{tenant_slug}/credentials   # register/replace a tenant's D365 credentials (either auth_mode)
+GET    /{tenant_slug}/credentials   # confirm what's registered (the secret is always masked)
 DELETE /{tenant_slug}/credentials   # revoke
 
 POST   /{tenant_slug}/credentials/verify   # prove the registered credentials actually work
@@ -88,7 +100,13 @@ DELETE /{tenant_slug}/custom-api-credentials   # revoke
 ### Before you register a D365 tenant
 
 Registering succeeds even if these aren't done — and then *every* D365
-tool call fails at runtime. Set them up first:
+tool call fails at runtime. Set them up first.
+
+**Both modes:** the Dataverse app registration must be provisioned as an
+**Application User** in the D365 org, or Dataverse returns 403 even with a
+valid token.
+
+**`key_vault` mode also needs:**
 
 1. **Two secrets must already exist in that tenant's Key Vault**, named
    exactly (names are hardcoded in `app/clients/keyvault_client.py`):
@@ -98,15 +116,18 @@ tool call fails at runtime. Set them up first:
    secrets** in that vault (RBAC role `Key Vault Secrets User`, or a
    `Get` access policy). It does **not** need any Dataverse access — it
    only reads the vault.
-3. **The Dataverse app registration** (the one whose ID is in
-   `Crm-Client-Id`) must be provisioned as an Application User in the
-   D365 org, or Dataverse returns 403 even with a valid token.
+
+#### `key_vault` mode (default)
+
+`auth_mode` may be omitted — it defaults to `key_vault`, so every body
+written before direct mode existed still means what it did.
 
 ```bash
 curl -s -X POST localhost:8000/geneco/credentials \
   -H 'Content-Type: application/json' \
   -H 'X-Admin-Api-Key: dev-admin-key' \
   -d '{
+    "auth_mode": "key_vault",
     "org_url": "https://geneco.crm.dynamics.com",
     "tenant_id": "<entra-tenant-guid>",
     "kv_vault_url": "https://<your-vault>.vault.azure.net",
@@ -122,6 +143,36 @@ curl -s -X POST localhost:8000/geneco/credentials \
 | `kv_vault_url` | The tenant's Key Vault, e.g. `https://your-vault.vault.azure.net` |
 | `kv_client_id` / `kv_client_secret` | The app registration that can **read that vault**. Not the D365 one — that gets fetched from the vault at call time and is never stored here |
 | `field_map` | Optional `{}`. Overrides the D365 incident column names used by `create_support_case` |
+
+#### `direct` mode
+
+For a tenant with no Key Vault. The pair you post here **is** the D365 app
+registration, and it is stored (encrypted) rather than fetched per call:
+
+```bash
+curl -s -X POST localhost:8000/geneco/credentials \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Api-Key: dev-admin-key' \
+  -d '{
+    "auth_mode": "direct",
+    "org_url": "https://geneco.crm.dynamics.com",
+    "tenant_id": "<entra-tenant-guid>",
+    "client_id": "<d365-app-client-id>",
+    "client_secret": "<d365-app-client-secret>"
+  }'
+```
+
+| Field | What it is |
+|---|---|
+| `org_url` / `tenant_id` | Same as above — `tenant_id` is the authority for the Dataverse token |
+| `client_id` / `client_secret` | The **D365** app registration itself — the one provisioned as an Application User in the org |
+| `field_map` | Optional `{}`, as above |
+
+A body must carry its own mode's fields and **only** its own: posting a
+`kv_*` field under `auth_mode: "direct"` (or vice versa) is a `422`, so a
+secret can never be stored as the wrong kind of credential. Rejected
+bodies never echo the value you posted — only the field path and the
+reason.
 
 The custom API has no vault — its Basic Auth credentials are stored
 directly:
@@ -145,11 +196,28 @@ immediately):
 ```json
 {
   "tenant_slug": "geneco",
+  "auth_mode": "key_vault",
   "org_url": "https://geneco.crm.dynamics.com/",
   "tenant_id": "...",
   "kv_vault_url": "https://your-vault.vault.azure.net/",
   "kv_client_id": "...",
   "kv_client_secret": "•••",
+  "field_map": {},
+  "enabled": true
+}
+```
+
+A `direct` registration echoes its own mode's fields instead — the other
+mode's columns are empty by construction, so they aren't returned at all:
+
+```json
+{
+  "tenant_slug": "geneco",
+  "auth_mode": "direct",
+  "org_url": "https://geneco.crm.dynamics.com/",
+  "tenant_id": "...",
+  "client_id": "...",
+  "client_secret": "•••",
   "field_map": {},
   "enabled": true
 }
@@ -161,10 +229,17 @@ returns `204`, or `404` if there was nothing to delete.
 ### Verifying a registration
 
 Registering only proves the values were *stored*. `verify` proves this
-service can actually use them right now: it does the same two hops a tool
-call does — Key Vault token -> read `Crm-Client-Id`/`Crm-Client-Secret` ->
-D365 token -> `WhoAmI` — from inside this process, so a green result
-accounts for this service's own egress, identity and firewall rules.
+service can actually use them right now, doing exactly the hops a tool
+call would from inside this process — so a green result accounts for this
+service's own egress, identity and firewall rules:
+
+- `key_vault` — Key Vault token -> read `Crm-Client-Id`/`Crm-Client-Secret`
+  -> D365 token -> `WhoAmI`
+- `direct` — D365 token -> `WhoAmI`, with no vault involved
+
+It branches on the mode stored for that tenant; you don't pass anything.
+The `detail` is worded for that mode, so a direct tenant is never told to
+check a vault secret that isn't in play.
 
 ```bash
 curl -s -X POST localhost:8000/geneco/credentials/verify \
@@ -283,12 +358,19 @@ curl -s -X POST "$HOST/$SLUG/credentials" \
        "kv_vault_url":"https://acme-kv.vault.azure.net",
        "kv_client_id":"<vault-reader-id>","kv_client_secret":"<vault-reader-secret>"}'
 
+#    ...or, for a tenant with no Key Vault, the D365 app registration itself:
+# curl -s -X POST "$HOST/$SLUG/credentials" \
+#   -H "X-Admin-Api-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+#   -d '{"auth_mode":"direct","org_url":"https://acme.crm.dynamics.com",
+#        "tenant_id":"<entra-guid>","client_id":"<d365-app-id>",
+#        "client_secret":"<d365-app-secret>"}'
+
 # 2. The custom cxchat API
 curl -s -X POST "$HOST/$SLUG/custom-api-credentials" \
   -H "X-Admin-Api-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"base_url":"https://<cxchat-host>/webapi","username":"<user>","password":"<pass>"}'
 
-# 3. Prove the D365 chain works (vault -> D365), no account number needed
+# 3. Prove the D365 chain works (vault -> D365, or D365 alone), no account number needed
 curl -s -X POST "$HOST/$SLUG/credentials/verify" -H "X-Admin-Api-Key: $ADMIN_KEY"
 
 # 4. Confirm the tools are visible
@@ -307,7 +389,7 @@ do that before blaming a tool call. Step 5 is the end-to-end test: if it
 returns `isError: true` with "not available for this workspace", nothing
 is registered for that slug; if it says "I can't check that right now",
 the credentials are registered but the vault or D365 rejected them (step
-3 will say which). Nothing verifies the custom API's credentials yet —
+3 will say which, in that tenant's mode's vocabulary). Nothing verifies the custom API's credentials yet —
 only D365 has a `verify`.
 
 ## Configuration

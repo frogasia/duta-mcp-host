@@ -84,7 +84,9 @@ cd geneco-mcp && make migrate && cd ..
 make run
 
 # Stage 1: register a tenant's Key Vault credentials, which the service uses
-# to fetch that tenant's D365 app registration at call time (X-Admin-Api-Key)
+# to fetch that tenant's D365 app registration at call time (X-Admin-Api-Key).
+# A tenant with no vault registers the D365 app registration itself instead —
+# add "auth_mode":"direct" with client_id/client_secret; see geneco-mcp/README.md
 curl -s -X POST localhost:8000/geneco-mcp/geneco/credentials \
   -H 'Content-Type: application/json' \
   -H 'X-Admin-Api-Key: dev-admin-key' \

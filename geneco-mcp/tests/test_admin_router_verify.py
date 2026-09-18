@@ -23,6 +23,7 @@ ORG_URL = "https://geneco.crm.dynamics.com"
 KV_URL = "https://geneco-kv.vault.azure.net"
 WHOAMI_URL = f"{ORG_URL}/api/data/v9.2/WhoAmI"
 VAULT_SECRET = "kv-secret-value"
+DIRECT_SECRET = "direct-secret-value"
 
 AUTH = {"X-Admin-Api-Key": TEST_ADMIN_API_KEY}
 
@@ -72,6 +73,21 @@ def _seed_credentials(client: TestClient, tenant_slug: str = "geneco") -> None:
             "kv_vault_url": KV_URL,
             "kv_client_id": "kv1",
             "kv_client_secret": VAULT_SECRET,
+        },
+    )
+    assert resp.status_code == 200
+
+
+def _seed_direct_credentials(client: TestClient, tenant_slug: str = "geneco") -> None:
+    resp = client.post(
+        f"/{tenant_slug}/credentials",
+        headers=AUTH,
+        json={
+            "auth_mode": "direct",
+            "org_url": ORG_URL,
+            "tenant_id": "t1",
+            "client_id": "d365-app-id",
+            "client_secret": DIRECT_SECRET,
         },
     )
     assert resp.status_code == 200
@@ -263,3 +279,84 @@ def test_an_unexpected_error_is_still_200(client: TestClient) -> None:
     assert body["ok"] is False
     assert "RuntimeError" in body["detail"]
 
+
+@respx.mock
+def test_direct_mode_verifies_without_touching_key_vault(client: TestClient) -> None:
+    """Only WhoAmI is mocked — respx fails any unmocked request, so a vault
+    hop here would fail this test rather than pass it silently."""
+    _seed_direct_credentials(client)
+    _mock_whoami()
+
+    with _stub_tokens():
+        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert ORG_URL in body["detail"]
+    # A green result must not claim a hop it never made.
+    assert "Key Vault" not in body["detail"]
+
+
+@respx.mock
+def test_direct_mode_403_names_the_registered_app_not_the_vault_secret(
+    client: TestClient,
+) -> None:
+    """``Crm-Client-Id`` is a vault secret that is not in play for a direct
+    tenant — naming it would send an admin looking for the wrong thing."""
+    _seed_direct_credentials(client)
+    _mock_whoami(Response(403, text="Forbidden"))
+
+    with _stub_tokens():
+        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert "Application User" in body["detail"]
+    assert "client_id" in body["detail"]
+    assert "Crm-Client-Id" not in body["detail"]
+
+
+@respx.mock
+def test_direct_mode_unreachable_org_is_200_not_5xx(client: TestClient) -> None:
+    _seed_direct_credentials(client)
+    respx.get(WHOAMI_URL).mock(side_effect=httpx.ConnectError("boom"))
+
+    with _stub_tokens():
+        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert ORG_URL in body["detail"]
+
+
+@respx.mock
+def test_direct_mode_verify_never_exposes_the_stored_secret(client: TestClient) -> None:
+    _seed_direct_credentials(client)
+    _mock_whoami()
+
+    with _stub_tokens():
+        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert DIRECT_SECRET not in resp.text
+
+
+@respx.mock
+def test_verify_follows_a_tenant_that_switches_mode(client: TestClient) -> None:
+    """Re-registering in the other mode must change which hops verify makes,
+    not just what is stored."""
+    _seed_credentials(client)
+    _mock_vault()
+    _mock_whoami()
+    with _stub_tokens():
+        assert client.post("/geneco/credentials/verify", headers=AUTH).json()["ok"] is True
+
+    _seed_direct_credentials(client)
+    with _stub_tokens():
+        body = client.post("/geneco/credentials/verify", headers=AUTH).json()
+
+    assert body["ok"] is True
+    assert "Key Vault" not in body["detail"]

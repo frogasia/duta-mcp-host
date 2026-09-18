@@ -25,46 +25,97 @@ import structlog
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 from geneco_mcp.clients.d365_connector import ConnectorError
 from geneco_mcp.clients.keyvault_client import KeyVaultError, describe as describe_vault_error
 from geneco_mcp.config import Settings
-from geneco_mcp.store.credentials import CredentialStore, D365CredentialsInput
+from geneco_mcp.store.credentials import (
+    AuthMode,
+    CredentialStore,
+    D365CredentialsInput,
+    ResolvedKvCredentials,
+)
 from geneco_mcp.store.crm_resolver import CrmCredentialResolver
 from geneco_mcp.store.custom_api_credentials import (
     CustomApiCredentialsInput,
     CustomApiCredentialStore,
 )
+from geneco_mcp.store.tables import DIRECT_AUTH_MODE, KEY_VAULT_AUTH_MODE
 
 log = structlog.get_logger()
 
 router = APIRouter()
 
-#: Upper bound on the whole vault -> D365 check, so a hanging backend can't
-#: pin an admin request open. Comfortably under the httpx timeouts of the
-#: two hops it wraps (15s vault, 20s Dataverse), and under what a portal
-#: "Test connection" button would wait for.
+#: Upper bound on the whole check, so a hanging backend can't pin an admin
+#: request open. Comfortably under the httpx timeouts of the hops it wraps
+#: (15s vault — ``key_vault`` mode only — and 20s Dataverse), and under
+#: what a portal "Test connection" button would wait for.
 VERIFY_TIMEOUT_SECONDS = 8.0
 
 
+#: Which fields belong to which ``auth_mode``. Used both ways round: the
+#: mode's own fields are required, and the *other* mode's are rejected —
+#: so a body can never carry two credential pairs, nor one labelled as the
+#: wrong kind of app registration.
+_MODE_FIELDS: dict[str, tuple[str, ...]] = {
+    DIRECT_AUTH_MODE: ("client_id", "client_secret"),
+    KEY_VAULT_AUTH_MODE: ("kv_vault_url", "kv_client_id", "kv_client_secret"),
+}
+
 
 class D365CredentialsIn(BaseModel):
-    """Key Vault credentials, not D365 ones — the D365 app registration is
-    read from the vault at call time (``Crm-Client-Id``/``Crm-Client-Secret``)
-    and never stored here."""
+    """A tenant's D365 setup in one of two shapes, chosen by ``auth_mode``
+    — mirroring the toggle duta-ilmu's tenant portal offers.
 
+    ``key_vault`` (the default): the credentials given are the *vault
+    reader's*, and the D365 app registration is read from that vault at
+    call time (``Crm-Client-Id``/``Crm-Client-Secret``), never stored here.
+
+    ``direct``: the credentials given *are* the D365 app registration, for
+    a tenant with no vault. That secret is then stored here (encrypted),
+    which the vault indirection exists to avoid — so prefer ``key_vault``
+    whenever a tenant can offer one.
+
+    One model rather than a discriminated union because ``auth_mode`` has
+    to be *optional*: every caller registering before direct mode existed
+    omits it and means ``key_vault``, and a tagged union cannot default its
+    own tag.
+    """
+
+    auth_mode: AuthMode = Field(
+        default=KEY_VAULT_AUTH_MODE,
+        description=(
+            "How the D365 credentials are supplied: 'key_vault' (default) to register a "
+            "vault-reader app the D365 app registration is fetched with, or 'direct' to "
+            "register the D365 app registration itself."
+        ),
+    )
     org_url: HttpUrl = Field(description="D365 org URL, e.g. https://yourorg.crm.dynamics.com")
     tenant_id: str = Field(
-        description="Entra (Azure AD) tenant GUID — used for both the Key Vault and D365 tokens."
+        description="Entra (Azure AD) tenant GUID — used for the D365 token in both modes, "
+        "and for the Key Vault token in key_vault mode."
     )
-    kv_vault_url: HttpUrl = Field(
-        description="Key Vault URL, e.g. https://your-vault.vault.azure.net"
+    kv_vault_url: HttpUrl | None = Field(
+        default=None,
+        description="key_vault mode only. Key Vault URL, e.g. https://your-vault.vault.azure.net",
     )
-    kv_client_id: str = Field(
-        description="Client/application ID of the Entra app registration that can read the vault."
+    kv_client_id: str | None = Field(
+        default=None,
+        description="key_vault mode only. Client/application ID of the Entra app registration "
+        "that can read the vault.",
     )
-    kv_client_secret: str = Field(description="That app registration's client secret.")
+    kv_client_secret: str | None = Field(
+        default=None, description="key_vault mode only. That app registration's client secret."
+    )
+    client_id: str | None = Field(
+        default=None,
+        description="direct mode only. Client/application ID of the D365 app registration "
+        "itself — the one provisioned as an Application User in the org.",
+    )
+    client_secret: str | None = Field(
+        default=None, description="direct mode only. That app registration's client secret."
+    )
     field_map: dict[str, str] = Field(
         default_factory=dict,
         description=(
@@ -73,15 +124,34 @@ class D365CredentialsIn(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _check_mode_fields(self) -> D365CredentialsIn:
+        required = _MODE_FIELDS[self.auth_mode]
+        missing = [name for name in required if getattr(self, name) is None]
+        if missing:
+            raise ValueError(
+                f"auth_mode '{self.auth_mode}' requires {', '.join(required)} — "
+                f"missing: {', '.join(missing)}"
+            )
+        other = next(mode for mode in _MODE_FIELDS if mode != self.auth_mode)
+        unexpected = [name for name in _MODE_FIELDS[other] if getattr(self, name) is not None]
+        if unexpected:
+            raise ValueError(
+                f"auth_mode '{self.auth_mode}' does not accept {', '.join(unexpected)} — "
+                f"those belong to auth_mode '{other}'"
+            )
+        return self
+
 
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """422 bodies with the offending *value* stripped out.
 
     FastAPI's default validation response echoes the submitted input back
     (``{"input": {...}}``), which on these routes means echoing a
-    ``kv_client_secret``/``password`` verbatim to whoever posted it — and
-    into any access log that captures response bodies. The field path and
-    message are what a portal actually renders, so only those are kept.
+    ``kv_client_secret``/``client_secret``/``password`` verbatim to whoever
+    posted it — and into any access log that captures response bodies. The
+    field path and message are what a portal actually renders, so only
+    those are kept.
 
     Registered app-wide in ``main.py`` rather than per-route (FastAPI
     handlers are app-level), which is harmless: the credential-intake
@@ -118,11 +188,14 @@ async def upsert_credentials(
         await store.upsert(
             tenant_slug,
             D365CredentialsInput(
+                auth_mode=body.auth_mode,
                 org_url=str(body.org_url),
                 tenant_id=body.tenant_id,
-                kv_vault_url=str(body.kv_vault_url),
+                kv_vault_url=str(body.kv_vault_url) if body.kv_vault_url else None,
                 kv_client_id=body.kv_client_id,
                 kv_client_secret=body.kv_client_secret,
+                client_id=body.client_id,
+                client_secret=body.client_secret,
                 field_map=body.field_map,
             ),
         )
@@ -172,30 +245,64 @@ class CredentialVerifyResult(BaseModel):
     secrets, app registrations and org URLs — never a secret *value*.
     """
 
-    ok: bool = Field(description="True only if both the vault read and the D365 call succeeded.")
+    ok: bool = Field(
+        description="True only if every hop this tenant's auth_mode requires succeeded — the "
+        "vault read and the D365 call in key_vault mode, the D365 call alone in direct mode."
+    )
     detail: str = Field(description="Human-readable outcome, safe to show an admin.")
     latency_ms: int = Field(description="Wall-clock time the whole check took.")
 
 
-def _d365_failure_detail(exc: ConnectorError, org_url: str) -> str:
-    """A D365-side failure in the vocabulary a tenant admin can act on."""
+def _d365_failure_detail(exc: ConnectorError, org_url: str, auth_mode: str) -> str:
+    """A D365-side failure in the vocabulary a tenant admin can act on.
+
+    The 401/403 wording differs by mode: in ``key_vault`` mode the app
+    registration D365 rejected is the one named by the vault's
+    ``Crm-Client-Id`` secret, while in ``direct`` mode it is the
+    ``client_id`` registered here — naming the vault secret to a direct
+    tenant would send them looking for something that isn't in play.
+    """
     if exc.status_code in (401, 403):
+        if auth_mode == DIRECT_AUTH_MODE:
+            return (
+                f"D365 rejected the registered credentials ({exc.status_code}) — check the "
+                "registered client_id app registration is provisioned as an Application User "
+                "in this org, and that its client_secret is current."
+            )
         return (
             f"D365 rejected the credentials read from Key Vault ({exc.status_code}) — check the "
             "Crm-Client-Id app registration is provisioned as an Application User in this org."
         )
     if exc.status_code is not None:
         return f"D365 returned {exc.status_code} for WhoAmI against {org_url}."
-    # No status code: token acquisition (bad tenant_id, bad Crm-Client-Secret)
+    # No status code: token acquisition (bad tenant_id, bad client secret)
     # or the org being unreachable. The underlying message carries the
     # actionable part (e.g. an AADSTS code) and holds no secret values.
     return f"Could not complete the D365 check against {org_url}: {exc}"
 
 
-async def _run_verification(resolver: CrmCredentialResolver, tenant_slug: str) -> tuple[bool, str]:
-    """The check itself: vault hop, then a D365 ``WhoAmI``. Every failure is
-    an answer — this returns ``(ok, detail)`` and never raises for a
-    credential or network problem."""
+def _success_detail(org_url: str, auth_mode: str) -> str:
+    """A green result should name the hops it actually made — claiming Key
+    Vault answered for a direct tenant would be a lie about what was
+    proven."""
+    if auth_mode == DIRECT_AUTH_MODE:
+        return (
+            "D365 answered — the registered app registration got a token and WhoAmI "
+            f"succeeded against {org_url}."
+        )
+    return (
+        "Key Vault and D365 both answered — the vault returned the D365 app registration "
+        f"and WhoAmI succeeded against {org_url}."
+    )
+
+
+async def _run_verification(
+    resolver: CrmCredentialResolver, tenant_slug: str, auth_mode: str
+) -> tuple[bool, str]:
+    """The check itself: a D365 ``WhoAmI``, preceded by the vault hop in
+    ``key_vault`` mode. Every failure is an answer — this returns
+    ``(ok, detail)`` and never raises for a credential or network
+    problem."""
     try:
         connector = await resolver.get_connector(tenant_slug)
     except ConnectorError as exc:
@@ -212,11 +319,8 @@ async def _run_verification(resolver: CrmCredentialResolver, tenant_slug: str) -
     try:
         await connector.who_am_i()
     except ConnectorError as exc:
-        return False, _d365_failure_detail(exc, connector.org_url)
-    return True, (
-        "Key Vault and D365 both answered — the vault returned the D365 app registration "
-        f"and WhoAmI succeeded against {connector.org_url}."
-    )
+        return False, _d365_failure_detail(exc, connector.org_url, auth_mode)
+    return True, _success_detail(connector.org_url, auth_mode)
 
 
 @router.post("/{tenant_slug}/credentials/verify", status_code=status.HTTP_200_OK)
@@ -241,18 +345,27 @@ async def verify_credentials(
     started = time.monotonic()
     async with request.app.state.session_factory() as session:
         store = CredentialStore(session, encryption_key=settings.credential_encryption_key)
-        if await store.get_kv_credentials(tenant_slug) is None:
+        credentials = await store.get_credentials(tenant_slug)
+        if credentials is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="no credentials registered"
             )
+        # Which mode this tenant is in decides how the outcome is phrased —
+        # the check itself is the resolver's business, not this route's.
+        auth_mode = (
+            KEY_VAULT_AUTH_MODE
+            if isinstance(credentials, ResolvedKvCredentials)
+            else DIRECT_AUTH_MODE
+        )
         resolver = CrmCredentialResolver(store, cache)
         try:
             ok, detail = await asyncio.wait_for(
-                _run_verification(resolver, tenant_slug), VERIFY_TIMEOUT_SECONDS
+                _run_verification(resolver, tenant_slug, auth_mode), VERIFY_TIMEOUT_SECONDS
             )
         except TimeoutError:
+            waited_on = "Key Vault or D365" if auth_mode == KEY_VAULT_AUTH_MODE else "D365"
             ok, detail = False, (
-                f"Timed out after {VERIFY_TIMEOUT_SECONDS:.0f}s waiting for Key Vault or D365."
+                f"Timed out after {VERIFY_TIMEOUT_SECONDS:.0f}s waiting for {waited_on}."
             )
         except Exception as exc:  # last net: a verify must never 5xx
             # Only the type — an arbitrary exception's message is not

@@ -22,8 +22,9 @@ duta-mcp-host/
         ├── clients/         # D365Connector (MSAL OAuth2) + CustomApiClient (Basic Auth)
         │                      + KeyVaultClient (reads each tenant's D365 creds at call time)
         ├── store/           # Postgres-backed tenant credential store, one table per connector
-        │                      kind, + crm_resolver.py's in-memory TTL cache of vault-fetched creds
-        └── security/        # Encryption for stored kv_client_secret/password (crypto.py)
+        │                      kind (D365 rows carry auth_mode: key_vault or direct), +
+        │                      crm_resolver.py's in-memory TTL cache of vault-fetched creds
+        └── security/        # Encryption for stored client secrets/password (crypto.py)
 ```
 
 `geneco-mcp` owns its own D365 connector, custom API client, and encrypted
@@ -110,20 +111,32 @@ proxying to a system that had this same gap).
 
 ### Credential security
 
-- **The D365 secret is never at rest here.** `d365_credentials` stores the
+- **In `key_vault` mode the D365 secret is never at rest here** — and that
+  mode is the default and the one to prefer. `d365_credentials` stores the
   tenant's *Key Vault* app registration; the real D365 one
   (`Crm-Client-Id`/`Crm-Client-Secret`, names hardcoded in
   `clients/keyvault_client.py`) is fetched on first use and lives only in
   the in-memory TTL cache in `store/crm_resolver.py`. Don't add a code path
   that writes a fetched `Crm-Client-Secret` to the DB or a log — that would
   undo the whole point of the indirection.
-- `kv_client_secret` is the only field encrypted at rest
-  (`security/crypto.py`, Fernet) — `org_url`/`tenant_id`/`kv_vault_url`/
-  `kv_client_id` are stored plain, matching the same secret/non-secret
-  split used elsewhere in this system.
+- `auth_mode: "direct"` is the deliberate exception, for tenants with no
+  vault to read from: `client_id`/`client_secret_encrypted` then hold the
+  D365 app registration itself. A row is in exactly one mode and `upsert`
+  clears the other mode's columns, so a tenant that moves to a vault
+  leaves no D365 secret behind. Don't add a precedence rule between the
+  two — there is only ever one pair to find.
+- The two secret columns (`kv_client_secret_encrypted`,
+  `client_secret_encrypted`) are the only fields encrypted at rest
+  (`security/crypto.py`, Fernet) — `org_url`/`tenant_id`/`auth_mode`/
+  `kv_vault_url`/`kv_client_id`/`client_id` are stored plain, matching the
+  same secret/non-secret split used elsewhere in this system.
 - Every read path (`GET`/`POST /{tenant_slug}/credentials`) returns a
-  masked placeholder for `kv_client_secret`, never the real value — see
-  `store/credentials.py`'s `MASK`.
+  masked placeholder in place of whichever secret the row holds, never the
+  real value — see `store/credentials.py`'s `MASK`. Validation failures go
+  through `admin_router.validation_error_handler`, which strips the
+  echoed input, so a rejected body can't bounce a posted secret back.
+- Per-mode field presence is enforced in the Pydantic intake model, not by
+  a DB constraint — a portal needs a readable 422, not an IntegrityError.
 - A vault failure must surface as a relayable error, never a 500: the
   resolver translates `KeyVaultError` into `ConnectorError` at its
   boundary so tool handlers keep catching one error type. Note this makes

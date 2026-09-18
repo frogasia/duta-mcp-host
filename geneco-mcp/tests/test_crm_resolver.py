@@ -24,6 +24,14 @@ CREDENTIALS = D365CredentialsInput(
     kv_client_secret="kv-secret",
 )
 
+DIRECT_CREDENTIALS = D365CredentialsInput(
+    auth_mode="direct",
+    org_url=ORG_URL,
+    tenant_id="t1",
+    client_id="direct-id",
+    client_secret="direct-secret",
+)
+
 
 @pytest.fixture
 async def store(settings: Settings) -> CredentialStore:
@@ -158,3 +166,70 @@ async def test_cache_is_per_tenant() -> None:
     cache.invalidate("a")
     assert cache.get("a") is None
     assert cache.get("b") == ("id-b", "secret-b")
+
+
+@respx.mock
+async def test_direct_mode_builds_a_connector_without_touching_the_vault(
+    store: CredentialStore,
+) -> None:
+    """No vault route is mocked here on purpose: respx fails any unmocked
+    request, so this passing *is* the assertion that no vault call was
+    made."""
+    await store.upsert("geneco", DIRECT_CREDENTIALS)
+    resolver = CrmCredentialResolver(store, CrmCredentialCache())
+
+    connector = await resolver.get_connector("geneco")
+
+    assert connector is not None
+    assert connector.client_id == "direct-id"
+    assert connector.client_secret == "direct-secret"
+    assert connector.org_url == ORG_URL
+
+
+async def test_direct_mode_never_writes_the_cache(store: CredentialStore) -> None:
+    """The cache exists to avoid a vault round-trip; direct mode has none to
+    avoid, and a D365 secret has no reason to sit in it."""
+    await store.upsert("geneco", DIRECT_CREDENTIALS)
+    cache = CrmCredentialCache()
+    resolver = CrmCredentialResolver(store, cache)
+
+    await resolver.get_connector("geneco")
+
+    assert cache.get("geneco") is None
+
+
+async def test_direct_mode_ignores_a_cache_entry_left_by_key_vault_mode(
+    store: CredentialStore,
+) -> None:
+    """A tenant that switched from vault to direct may still have a cached
+    vault-fetched pair under its slug until the TTL expires — the direct
+    path must use the stored credentials, not that."""
+    await store.upsert("geneco", DIRECT_CREDENTIALS)
+    cache = CrmCredentialCache()
+    cache.set("geneco", client_id="stale-vault-id", client_secret="stale-vault-secret")
+    resolver = CrmCredentialResolver(store, cache)
+
+    connector = await resolver.get_connector("geneco")
+
+    assert connector is not None
+    assert connector.client_id == "direct-id"
+    assert connector.client_secret == "direct-secret"
+
+
+@respx.mock
+async def test_switching_to_direct_mode_stops_using_the_vault(store: CredentialStore) -> None:
+    """End to end through the store: a re-registered tenant resolves the new
+    way, with the old vault credentials gone from the row."""
+    await store.upsert("geneco", CREDENTIALS)
+    id_route, _ = _mock_vault()
+    resolver = CrmCredentialResolver(store, CrmCredentialCache())
+    with _stub_token():
+        await resolver.get_connector("geneco")
+    assert id_route.call_count == 1
+
+    await store.upsert("geneco", DIRECT_CREDENTIALS)
+    connector = await resolver.get_connector("geneco")
+
+    assert connector is not None
+    assert connector.client_id == "direct-id"
+    assert id_route.call_count == 1
