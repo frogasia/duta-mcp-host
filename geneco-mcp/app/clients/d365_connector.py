@@ -14,8 +14,9 @@ integration-hub calls.
 
 Only the three operations geneco-mcp's tools actually use are ported
 (``get_account_by_filter``, ``create_case``, ``list_incidents_for_customer``)
-— no ``add_comment``/``sync_status``/``test_connection``, since nothing
-here calls them (YAGNI).
+— no ``add_comment``/``sync_status``, since nothing here calls them (YAGNI).
+The one addition is ``who_am_i``, the credential-verify endpoint's
+connectivity probe (``protocol/admin_router.py``).
 """
 
 from __future__ import annotations
@@ -37,9 +38,18 @@ ODATA_HEADERS = {
 
 
 class ConnectorError(Exception):
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    """``status_code`` is set only when Dataverse actually answered with an
+    HTTP error — carried structurally (like ``KeyVaultError``'s) so callers
+    that explain *why* a call failed can branch on it rather than parsing
+    message text. ``None`` means the failure was before/around the response
+    (token acquisition, network, malformed body)."""
+
+    def __init__(
+        self, message: str, *, retryable: bool = True, status_code: int | None = None
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
 
 
 def _odata_escape(value: str) -> str:
@@ -111,12 +121,15 @@ class D365Connector:
         self, method: str, url: str, *, json_body: dict[str, Any] | None = None
     ) -> httpx.Response:
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.request(method, url, json=json_body, headers=self._headers())
         except httpx.HTTPError as exc:
             raise ConnectorError(f"D365 request failed: {exc}") from exc
         if resp.status_code >= 400:
-            raise ConnectorError(f"D365 request failed {resp.status_code}: {resp.text[:500]}")
+            raise ConnectorError(
+                f"D365 request failed {resp.status_code}: {resp.text[:500]}",
+                status_code=resp.status_code,
+            )
         return resp
 
     @staticmethod
@@ -132,6 +145,22 @@ class D365Connector:
         body = {col: src[field] for field, col in field_map.items() if src.get(field)}
         body["customerid_account@odata.bind"] = f"/accounts({account_guid})"
         return body
+
+    async def who_am_i(self) -> dict[str, Any]:
+        """Cheapest proof this tenant's credentials actually work: acquire a
+        token and call Dataverse's ``WhoAmI``, which touches no business data
+        and needs no arguments. Returns Dataverse's own response
+        (``UserId``/``BusinessUnitId``/``OrganizationId``).
+
+        Used by the credential-verify endpoint; it lives here rather than in
+        the router so the honest-error boundary in ``_request`` covers it like
+        every other operation.
+        """
+        resp = await self._request("GET", f"{self._api_base}/WhoAmI")
+        value = self._json_value(resp)
+        if not isinstance(value, dict):
+            raise ConnectorError("unexpected D365 WhoAmI response shape", retryable=False)
+        return value
 
     async def create_case(self, *, title: str, description: str, account_guid: str) -> str:
         """Create a D365 incident bound to ``account_guid``, return its GUID."""

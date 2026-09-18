@@ -123,6 +123,38 @@ async def test_get_account_by_filter_non_200_raises_connector_error_not_uncaught
 
 
 @respx.mock
+async def test_who_am_i_returns_dataverse_identity(connector: D365Connector) -> None:
+    """The credential-verify probe: cheapest proof a token works, touching
+    no business data."""
+    route = respx.get(f"{ORG_URL}/api/data/v9.2/WhoAmI").mock(
+        return_value=Response(200, json={"UserId": "u-1", "OrganizationId": "o-1"})
+    )
+    with stub_token(connector):
+        assert (await connector.who_am_i())["OrganizationId"] == "o-1"
+    assert route.called
+
+
+@respx.mock
+async def test_who_am_i_non_200_raises_connector_error_carrying_the_status(
+    connector: D365Connector,
+) -> None:
+    respx.get(f"{ORG_URL}/api/data/v9.2/WhoAmI").mock(return_value=Response(403, text="Forbidden"))
+    with stub_token(connector):
+        with pytest.raises(ConnectorError) as exc:
+            await connector.who_am_i()
+    assert exc.value.status_code == 403
+
+
+@respx.mock
+async def test_who_am_i_network_failure_raises_connector_error(connector: D365Connector) -> None:
+    respx.get(f"{ORG_URL}/api/data/v9.2/WhoAmI").mock(side_effect=httpx.ConnectError("boom"))
+    with stub_token(connector):
+        with pytest.raises(ConnectorError) as exc:
+            await connector.who_am_i()
+    assert exc.value.status_code is None
+
+
+@respx.mock
 async def test_create_case_returns_guid(connector: D365Connector) -> None:
     respx.post(f"{ORG_URL}/api/data/v9.2/incidents").mock(
         return_value=Response(

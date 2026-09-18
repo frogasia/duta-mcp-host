@@ -78,6 +78,8 @@ POST   /{tenant_slug}/credentials   # register/replace a tenant's D365 credentia
 GET    /{tenant_slug}/credentials   # confirm what's registered (kv_client_secret always masked)
 DELETE /{tenant_slug}/credentials   # revoke
 
+POST   /{tenant_slug}/credentials/verify   # prove the registered credentials actually work
+
 POST   /{tenant_slug}/custom-api-credentials   # register/replace the custom API's Basic Auth creds
 GET    /{tenant_slug}/custom-api-credentials   # confirm what's registered (password always masked)
 DELETE /{tenant_slug}/custom-api-credentials   # revoke
@@ -155,6 +157,41 @@ immediately):
 
 `GET` returns the same shape (`404` if nothing is registered); `DELETE`
 returns `204`, or `404` if there was nothing to delete.
+
+### Verifying a registration
+
+Registering only proves the values were *stored*. `verify` proves this
+service can actually use them right now: it does the same two hops a tool
+call does — Key Vault token -> read `Crm-Client-Id`/`Crm-Client-Secret` ->
+D365 token -> `WhoAmI` — from inside this process, so a green result
+accounts for this service's own egress, identity and firewall rules.
+
+```bash
+curl -s -X POST localhost:8000/geneco/credentials/verify \
+  -H 'X-Admin-Api-Key: dev-admin-key'
+```
+
+```json
+{
+  "ok": true,
+  "detail": "Key Vault and D365 both answered — the vault returned the D365 app registration and WhoAmI succeeded against https://geneco.crm.dynamics.com.",
+  "latency_ms": 412
+}
+```
+
+There is no request body — it verifies what is already registered for
+that slug. A *failing* check is an answer, not an error: the response is
+still `200`, with `ok: false` and a `detail` naming the actionable cause
+(vault access policy, missing secret, D365 rejecting the app
+registration, unreachable host, timeout). The only non-`200`s are `401`
+(bad admin key) and `404` (nothing registered for that slug). `detail` is
+safe to show a tenant admin verbatim — it names secrets and app
+registrations, never a secret value.
+
+Two things worth knowing: the check deliberately bypasses the cached D365
+app registration (a verify served from cache would prove nothing about
+the vault *now*), so the next tool call for that tenant pays one extra
+vault round-trip; and the whole check is bounded at 8 seconds.
 
 **Stage 2 — the MCP protocol face**, matching exactly what duta-ilmu's
 orchestrator MCP client speaks
@@ -251,21 +288,27 @@ curl -s -X POST "$HOST/$SLUG/custom-api-credentials" \
   -H "X-Admin-Api-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"base_url":"https://<cxchat-host>/webapi","username":"<user>","password":"<pass>"}'
 
-# 3. Confirm the tools are visible
+# 3. Prove the D365 chain works (vault -> D365), no account number needed
+curl -s -X POST "$HOST/$SLUG/credentials/verify" -H "X-Admin-Api-Key: $ADMIN_KEY"
+
+# 4. Confirm the tools are visible
 curl -s -X POST "$HOST/$SLUG" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 
-# 4. Prove the whole chain works (vault -> D365) with a real account
+# 5. End to end, with a real account
 curl -s -X POST "$HOST/$SLUG" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"verify_account",
        "arguments":{"account_id":"<acct>","mobile_number":"<mobile>"}}}'
 ```
 
-Step 4 is the real test — steps 1–2 only prove the credentials were
-*stored*, not that they *work*. If step 4 returns `isError: true` with
-"not available for this workspace", nothing is registered for that slug;
-if it says "I can't check that right now", the credentials are registered
-but the vault or D365 rejected them.
+Steps 1–2 only prove the credentials were *stored*. Step 3 is what proves
+the D365 ones *work*, and its `detail` says what to fix if they don't —
+do that before blaming a tool call. Step 5 is the end-to-end test: if it
+returns `isError: true` with "not available for this workspace", nothing
+is registered for that slug; if it says "I can't check that right now",
+the credentials are registered but the vault or D365 rejected them (step
+3 will say which). Nothing verifies the custom API's credentials yet —
+only D365 has a `verify`.
 
 ## Configuration
 

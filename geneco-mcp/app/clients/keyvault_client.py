@@ -36,9 +36,57 @@ GENECO_CRM_CLIENT_SECRET_SECRET = "Crm-Client-Secret"
 
 
 class KeyVaultError(Exception):
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    """``status_code``/``secret_name`` are carried structurally rather than
+    only in the message so callers that need to explain *why* a vault read
+    failed (the credential-verify endpoint) can branch on them instead of
+    parsing message text."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        status_code: int | None = None,
+        secret_name: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
+        self.secret_name = secret_name
+
+
+def describe(exc: KeyVaultError) -> str:
+    """A vault failure in the vocabulary a tenant admin can act on.
+
+    Used for the human-readable ``detail`` of the credential-verify
+    endpoint, so it names secrets and app registrations but never any
+    value.
+    """
+    where = f"secret {exc.secret_name!r}" if exc.secret_name else "the vault"
+    if exc.status_code == 403:
+        return (
+            f"Key Vault denied access to {where} — the registered kv_client_id app "
+            "registration needs Get on secrets in that vault (RBAC role "
+            "'Key Vault Secrets User', or a Get access policy)."
+        )
+    if exc.status_code == 401:
+        return (
+            "Key Vault rejected the registered vault credentials — check kv_client_id, "
+            "kv_client_secret and tenant_id."
+        )
+    if exc.status_code == 404:
+        return (
+            f"Key Vault has no {where} — create it in that vault (the names are fixed: "
+            f"{GENECO_CRM_CLIENT_ID_SECRET} / {GENECO_CRM_CLIENT_SECRET_SECRET})."
+        )
+    if exc.status_code is not None:
+        # The message for an HTTP failure embeds the vault's own response
+        # body; never relay that onward — an upstream body is not ours to
+        # vouch for, and this string is shown in a tenant-facing portal.
+        return f"Key Vault returned {exc.status_code} for {where}."
+    # No status code: our own message for a token, network or parse failure
+    # (the actionable part is msal's/httpx's, e.g. an AADSTS code).
+    return f"Key Vault check failed: {exc}"
 
 
 class KeyVaultClient:
@@ -95,19 +143,25 @@ class KeyVaultClient:
                     },
                 )
         except httpx.HTTPError as exc:
-            raise KeyVaultError(f"key vault request failed: {exc}") from exc
+            raise KeyVaultError(f"key vault request failed: {exc}", secret_name=name) from exc
         if resp.status_code >= 400:
             raise KeyVaultError(
                 f"key vault request failed {resp.status_code}: {resp.text[:500]}",
                 retryable=resp.status_code >= 500,
+                status_code=resp.status_code,
+                secret_name=name,
             )
         try:
             data = resp.json()
         except ValueError as exc:
-            raise KeyVaultError("malformed key vault response (not JSON)") from exc
+            raise KeyVaultError(
+                "malformed key vault response (not JSON)", secret_name=name
+            ) from exc
         value = data.get("value")
         if not value:
-            raise KeyVaultError(f"key vault secret {name!r} has no value", retryable=False)
+            raise KeyVaultError(
+                f"key vault secret {name!r} has no value", retryable=False, secret_name=name
+            )
         return value
 
     async def get_crm_credentials(self) -> tuple[str, str]:

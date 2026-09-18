@@ -1,6 +1,9 @@
 """Stage-1 credential intake: ``POST``/``GET``/``DELETE
 /{tenant_slug}/credentials`` (D365) and ``.../custom-api-credentials``
-(the custom fee-waiver/re-contract API).
+(the custom fee-waiver/re-contract API), plus
+``POST /{tenant_slug}/credentials/verify``, which proves the registered
+D365 credentials actually work *from this process* rather than from
+whatever service is asking.
 
 This is a fundamentally more sensitive surface than the MCP ``tools/call``
 endpoint (``router.py``) — it accepts real secrets (D365 ``client_secret``,
@@ -13,15 +16,20 @@ route here requires ``X-Admin-Api-Key``, mirroring integration-hub's
 
 from __future__ import annotations
 
+import asyncio
 import secrets
+import time
 from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, HttpUrl
 
+from geneco_mcp.clients.d365_connector import ConnectorError
+from geneco_mcp.clients.keyvault_client import KeyVaultError, describe as describe_vault_error
 from geneco_mcp.config import Settings
 from geneco_mcp.store.credentials import CredentialStore, D365CredentialsInput
+from geneco_mcp.store.crm_resolver import CrmCredentialResolver
 from geneco_mcp.store.custom_api_credentials import (
     CustomApiCredentialsInput,
     CustomApiCredentialStore,
@@ -30,6 +38,13 @@ from geneco_mcp.store.custom_api_credentials import (
 log = structlog.get_logger()
 
 router = APIRouter()
+
+#: Upper bound on the whole vault -> D365 check, so a hanging backend can't
+#: pin an admin request open. Comfortably under the httpx timeouts of the
+#: two hops it wraps (15s vault, 20s Dataverse), and under what a portal
+#: "Test connection" button would wait for.
+VERIFY_TIMEOUT_SECONDS = 8.0
+
 
 
 class D365CredentialsIn(BaseModel):
@@ -122,6 +137,106 @@ async def delete_credentials(
     request.app.state.crm_cache.invalidate(tenant_slug)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no credentials registered")
+
+
+class CredentialVerifyResult(BaseModel):
+    """What ``POST /{tenant_slug}/credentials/verify`` answers with.
+
+    ``detail`` is rendered verbatim in a tenant-facing portal, so it names
+    secrets, app registrations and org URLs — never a secret *value*.
+    """
+
+    ok: bool = Field(description="True only if both the vault read and the D365 call succeeded.")
+    detail: str = Field(description="Human-readable outcome, safe to show an admin.")
+    latency_ms: int = Field(description="Wall-clock time the whole check took.")
+
+
+def _d365_failure_detail(exc: ConnectorError, org_url: str) -> str:
+    """A D365-side failure in the vocabulary a tenant admin can act on."""
+    if exc.status_code in (401, 403):
+        return (
+            f"D365 rejected the credentials read from Key Vault ({exc.status_code}) — check the "
+            "Crm-Client-Id app registration is provisioned as an Application User in this org."
+        )
+    if exc.status_code is not None:
+        return f"D365 returned {exc.status_code} for WhoAmI against {org_url}."
+    # No status code: token acquisition (bad tenant_id, bad Crm-Client-Secret)
+    # or the org being unreachable. The underlying message carries the
+    # actionable part (e.g. an AADSTS code) and holds no secret values.
+    return f"Could not complete the D365 check against {org_url}: {exc}"
+
+
+async def _run_verification(resolver: CrmCredentialResolver, tenant_slug: str) -> tuple[bool, str]:
+    """The check itself: vault hop, then a D365 ``WhoAmI``. Every failure is
+    an answer — this returns ``(ok, detail)`` and never raises for a
+    credential or network problem."""
+    try:
+        connector = await resolver.get_connector(tenant_slug)
+    except ConnectorError as exc:
+        # The resolver translates KeyVaultError at its boundary; the original
+        # is kept as __cause__, and carries the status code that tells an
+        # admin whether this is an access policy, a missing secret or worse.
+        cause = exc.__cause__
+        if isinstance(cause, KeyVaultError):
+            return False, describe_vault_error(cause)
+        return False, f"Could not read this tenant's D365 credentials: {exc}"
+    if connector is None:
+        # Raced with a DELETE between the registration check and here.
+        return False, "No credentials are registered for this tenant."
+    try:
+        await connector.who_am_i()
+    except ConnectorError as exc:
+        return False, _d365_failure_detail(exc, connector.org_url)
+    return True, (
+        "Key Vault and D365 both answered — the vault returned the D365 app registration "
+        f"and WhoAmI succeeded against {connector.org_url}."
+    )
+
+
+@router.post("/{tenant_slug}/credentials/verify", status_code=status.HTTP_200_OK)
+async def verify_credentials(
+    tenant_slug: str,
+    request: Request,
+    x_admin_api_key: Annotated[str | None, Header()] = None,
+) -> CredentialVerifyResult:
+    """Prove the *registered* credentials work, from this process.
+
+    A failing check is an answer, not a server error: everything but a bad
+    admin key (401) and an unregistered tenant (404) comes back 200 with
+    ``ok=false``.
+    """
+    settings: Settings = request.app.state.settings
+    _require_admin_key(settings, x_admin_api_key)
+    cache = request.app.state.crm_cache
+    # A verify served from the credential cache proves nothing about the
+    # vault *now* — force the vault hop, exactly as upsert/delete do.
+    cache.invalidate(tenant_slug)
+
+    started = time.monotonic()
+    async with request.app.state.session_factory() as session:
+        store = CredentialStore(session, encryption_key=settings.credential_encryption_key)
+        if await store.get_kv_credentials(tenant_slug) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="no credentials registered"
+            )
+        resolver = CrmCredentialResolver(store, cache)
+        try:
+            ok, detail = await asyncio.wait_for(
+                _run_verification(resolver, tenant_slug), VERIFY_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            ok, detail = False, (
+                f"Timed out after {VERIFY_TIMEOUT_SECONDS:.0f}s waiting for Key Vault or D365."
+            )
+        except Exception as exc:  # last net: a verify must never 5xx
+            # Only the type — an arbitrary exception's message is not
+            # guaranteed free of anything sensitive.
+            ok, detail = False, f"Verification failed unexpectedly ({type(exc).__name__})."
+            log.exception("credentials.verify_unexpected_error", tenant_slug=tenant_slug)
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    log.info("credentials.verified", tenant_slug=tenant_slug, ok=ok, latency_ms=latency_ms)
+    return CredentialVerifyResult(ok=ok, detail=detail, latency_ms=latency_ms)
 
 
 class CustomApiCredentialsIn(BaseModel):
