@@ -23,6 +23,8 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 
 from geneco_mcp.clients.d365_connector import ConnectorError
@@ -70,6 +72,30 @@ class D365CredentialsIn(BaseModel):
             'as {"title": "<column>", "description": "<column>"}. Defaults to subject/description.'
         ),
     )
+
+
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 bodies with the offending *value* stripped out.
+
+    FastAPI's default validation response echoes the submitted input back
+    (``{"input": {...}}``), which on these routes means echoing a
+    ``kv_client_secret``/``password`` verbatim to whoever posted it — and
+    into any access log that captures response bodies. The field path and
+    message are what a portal actually renders, so only those are kept.
+
+    Registered app-wide in ``main.py`` rather than per-route (FastAPI
+    handlers are app-level), which is harmless: the credential-intake
+    routes here are the only ones in this service that use FastAPI body
+    validation at all — ``protocol/router.py`` parses its own JSON-RPC
+    envelope.
+    """
+    errors = [
+        {key: value for key, value in error.items() if key not in ("input", "ctx")}
+        for error in exc.errors()
+    ]
+    # Literal 422: starlette renamed its constant and deprecated the old
+    # spelling, and this file supports both sides of that rename.
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 def _require_admin_key(settings: Settings, x_admin_api_key: str | None) -> None:

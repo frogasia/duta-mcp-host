@@ -13,10 +13,12 @@ integration-hub.
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 
 from geneco_mcp.config import Settings
 from geneco_mcp.db import build_engine, build_session_factory
 from geneco_mcp.protocol.admin_router import router as admin_router
+from geneco_mcp.protocol.admin_router import validation_error_handler
 from geneco_mcp.protocol.router import router
 from geneco_mcp.store.crm_resolver import CrmCredentialCache
 
@@ -29,6 +31,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.engine = engine
     application.state.session_factory = build_session_factory(engine)
     application.state.crm_cache = CrmCredentialCache()
+    # Keeps posted secrets out of 422 bodies — see the handler's docstring.
+    application.add_exception_handler(RequestValidationError, validation_error_handler)
     application.include_router(admin_router)
     application.include_router(router)
 
