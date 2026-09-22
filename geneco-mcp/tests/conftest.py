@@ -30,11 +30,25 @@ def settings(tmp_path) -> Settings:
     )
 
 
+# The two MCP servers, over one database. Built from the same ``settings``
+# fixture on purpose: a test can seed through one client and read through
+# the other, which is what registering each backend's credentials
+# separately actually looks like.
 @pytest.fixture
-def app(settings: Settings) -> FastAPI:
-    return create_app(settings)
+def crm_app(settings: Settings) -> FastAPI:
+    return create_app(settings, kind="crm")
 
 
 @pytest.fixture
-def client(app: FastAPI) -> TestClient:
-    return TestClient(app)
+def ssp_app(settings: Settings) -> FastAPI:
+    return create_app(settings, kind="ssp")
+
+
+@pytest.fixture
+def crm_client(crm_app: FastAPI) -> TestClient:
+    return TestClient(crm_app)
+
+
+@pytest.fixture
+def ssp_client(ssp_app: FastAPI) -> TestClient:
+    return TestClient(ssp_app)

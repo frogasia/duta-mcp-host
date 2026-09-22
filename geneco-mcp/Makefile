@@ -1,4 +1,4 @@
-.PHONY: install dev run migrate test lint format
+.PHONY: install dev run run-ssp migrate test lint format
 
 install:
 	python3 -m venv .venv
@@ -11,7 +11,10 @@ dev:
 	.venv/bin/pip install -e ../shared -e ".[dev]"
 
 run:
-	.venv/bin/python -m geneco_mcp.run
+	.venv/bin/python -m geneco_mcp.run crm
+
+run-ssp:
+	.venv/bin/python -m geneco_mcp.run ssp
 
 migrate:
 	.venv/bin/alembic upgrade head

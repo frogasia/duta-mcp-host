@@ -25,6 +25,7 @@ class GetSupportCasesInput(BaseModel):
 
 @register(
     "get_support_cases",
+    kind="crm",
     description=(
         "List a customer's support cases, after verifying their account "
         "number and mobile number match."

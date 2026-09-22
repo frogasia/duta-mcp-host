@@ -1,5 +1,11 @@
 """MCP JSON-RPC endpoint: ``POST /{tenant_slug}``.
 
+Serves one *kind* of tool — whichever the app mounting it was built for
+(``main.py``). The same module backs both ``geneco-crm-mcp`` and
+``geneco-ssp-mcp``; everything kind-specific is read off ``app.state``
+rather than the global registry, so neither endpoint can list or run the
+other's tools.
+
 Speaks exactly the subset duta-ilmu's orchestrator MCP client uses
 (``services/orchestrator/src/orchestrator/tools/mcp.py`` in the duta-ilmu
 repo): ``initialize`` -> ``notifications/initialized`` -> ``tools/list`` /
@@ -30,28 +36,49 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from geneco_mcp.config import Settings
 from geneco_mcp.protocol.models import JsonRpcId, rpc_error, rpc_result
+from geneco_mcp.store.credentials import CredentialStore
 from geneco_mcp.store.crm_resolver import CrmCredentialCache
-from geneco_mcp.tools import all_tools, get_tool
-from geneco_mcp.tools.registry import ToolContext
+from geneco_mcp.store.ssp_resolver import SspCredentialCache
+from geneco_mcp.store.custom_api_credentials import CustomApiCredentialStore
+from geneco_mcp.tools.registry import ToolContext, ToolKind, ToolSpec
 
 log = structlog.get_logger()
 
 PROTOCOL_VERSION = "2025-03-26"
-SERVER_INFO = {"name": "geneco-mcp", "version": "0.1.0"}
+SERVER_VERSION = "0.1.0"
 SESSION_HEADER = "Mcp-Session-Id"
 
 router = APIRouter()
 
 
-def _tool_defs() -> list[dict[str, Any]]:
+def _tool_defs(specs: tuple[ToolSpec, ...]) -> list[dict[str, Any]]:
     return [
         {
             "name": spec.name,
             "description": spec.description,
             "inputSchema": spec.input_model.model_json_schema(),
         }
-        for spec in all_tools()
+        for spec in specs
     ]
+
+
+async def _is_configured(
+    kind: ToolKind,
+    tenant_slug: str,
+    *,
+    settings: Settings,
+    session_factory: async_sessionmaker,
+) -> bool:
+    """Whether this tenant has registered the credential kind these tools
+    need. A row's presence only — no vault hop, no outbound call."""
+    async with session_factory() as session:
+        if kind == "crm":
+            return await CredentialStore(
+                session, encryption_key=settings.credential_encryption_key
+            ).is_registered(tenant_slug)
+        return await CustomApiCredentialStore(
+            session, encryption_key=settings.credential_encryption_key
+        ).is_registered(tenant_slug)
 
 
 async def _handle_tools_call(
@@ -61,10 +88,15 @@ async def _handle_tools_call(
     settings: Settings,
     session_factory: async_sessionmaker,
     crm_cache: CrmCredentialCache,
+    ssp_cache: SspCredentialCache,
+    tools_by_name: dict[str, ToolSpec],
 ) -> dict[str, Any]:
     name = params.get("name")
     arguments = params.get("arguments") or {}
-    spec = get_tool(name) if isinstance(name, str) else None
+    # This app's tools only — never the global registry. An endpoint that
+    # would run a tool it never advertised is a hole in the split, not a
+    # convenience.
+    spec = tools_by_name.get(name) if isinstance(name, str) else None
     if spec is None:
         return {"content": [{"type": "text", "text": f"unknown tool: {name!r}"}], "isError": True}
     try:
@@ -79,6 +111,7 @@ async def _handle_tools_call(
             session=session,
             encryption_key=settings.credential_encryption_key,
             crm_cache=crm_cache,
+            ssp_cache=ssp_cache,
         )
         result = await spec.handler(ctx, tenant_slug, parsed_args)
     return {
@@ -107,7 +140,7 @@ async def mcp_endpoint(tenant_slug: str, request: Request) -> Response:
         result = {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
-            "serverInfo": SERVER_INFO,
+            "serverInfo": {"name": request.app.state.server_name, "version": SERVER_VERSION},
         }
         return JSONResponse(
             rpc_result(request_id, result), headers={SESSION_HEADER: uuid.uuid4().hex}
@@ -118,7 +151,19 @@ async def mcp_endpoint(tenant_slug: str, request: Request) -> Response:
         return Response(status_code=202)
 
     if method == "tools/list":
-        return JSONResponse(rpc_result(request_id, {"tools": _tool_defs()}))
+        # Advertised only once the credentials behind them exist: a tenant
+        # mid-onboarding would otherwise be offered tools whose every call
+        # answers "not available for this workspace right now". An empty
+        # list is the honest answer, and the list grows by itself the
+        # moment stage-1 intake lands.
+        configured = await _is_configured(
+            request.app.state.tool_kind,
+            tenant_slug,
+            settings=settings,
+            session_factory=request.app.state.session_factory,
+        )
+        tools = _tool_defs(request.app.state.tools) if configured else []
+        return JSONResponse(rpc_result(request_id, {"tools": tools}))
 
     if method == "tools/call":
         result = await _handle_tools_call(
@@ -127,6 +172,8 @@ async def mcp_endpoint(tenant_slug: str, request: Request) -> Response:
             settings=settings,
             session_factory=request.app.state.session_factory,
             crm_cache=request.app.state.crm_cache,
+            ssp_cache=request.app.state.ssp_cache,
+            tools_by_name=request.app.state.tools_by_name,
         )
         return JSONResponse(rpc_result(request_id, result))
 

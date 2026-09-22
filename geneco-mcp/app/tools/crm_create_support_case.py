@@ -29,6 +29,7 @@ class CreateSupportCaseInput(BaseModel):
 
 @register(
     "create_support_case",
+    kind="crm",
     description=(
         "Create a support case for a customer, after verifying their account "
         "number and mobile number match."

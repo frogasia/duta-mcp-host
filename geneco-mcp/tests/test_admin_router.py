@@ -38,61 +38,61 @@ def _row(settings: Settings, tenant_slug: str = "geneco") -> sa.Row:
     return row
 
 
-def test_upsert_requires_admin_key(client: TestClient) -> None:
-    resp = client.post("/geneco/credentials", json=CREDENTIALS_BODY)
+def test_upsert_requires_admin_key(crm_client: TestClient) -> None:
+    resp = crm_client.post("/geneco/credentials", json=CREDENTIALS_BODY)
     assert resp.status_code == 401
 
 
-def test_upsert_rejects_wrong_admin_key(client: TestClient) -> None:
-    resp = client.post(
+def test_upsert_rejects_wrong_admin_key(crm_client: TestClient) -> None:
+    resp = crm_client.post(
         "/geneco/credentials", headers={"X-Admin-Api-Key": "wrong-key"}, json=CREDENTIALS_BODY
     )
     assert resp.status_code == 401
 
 
-def test_upsert_then_get_never_exposes_the_real_secret(client: TestClient) -> None:
-    resp = client.post(
+def test_upsert_then_get_never_exposes_the_real_secret(crm_client: TestClient) -> None:
+    resp = crm_client.post(
         "/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY}, json=CREDENTIALS_BODY
     )
     assert resp.status_code == 200
     assert resp.json()["kv_client_secret"] == "•••"
     assert "super-secret-value" not in resp.text
 
-    get_resp = client.get("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
+    get_resp = crm_client.get("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
     assert get_resp.status_code == 200
     assert get_resp.json()["kv_client_secret"] == "•••"
     assert "super-secret-value" not in get_resp.text
 
 
-def test_get_missing_tenant_is_404(client: TestClient) -> None:
-    resp = client.get("/unknown-tenant/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
+def test_get_missing_tenant_is_404(crm_client: TestClient) -> None:
+    resp = crm_client.get("/unknown-tenant/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
     assert resp.status_code == 404
 
 
-def test_delete_then_get_is_404(client: TestClient) -> None:
-    client.post("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY}, json=CREDENTIALS_BODY)
-    del_resp = client.delete("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
+def test_delete_then_get_is_404(crm_client: TestClient) -> None:
+    crm_client.post("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY}, json=CREDENTIALS_BODY)
+    del_resp = crm_client.delete("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
     assert del_resp.status_code == 204
-    get_resp = client.get("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
+    get_resp = crm_client.get("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
     assert get_resp.status_code == 404
 
 
-def test_delete_missing_tenant_is_404(client: TestClient) -> None:
-    resp = client.delete("/unknown-tenant/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
+def test_delete_missing_tenant_is_404(crm_client: TestClient) -> None:
+    resp = crm_client.delete("/unknown-tenant/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
     assert resp.status_code == 404
 
 
-def test_key_vault_is_the_default_auth_mode(client: TestClient) -> None:
+def test_key_vault_is_the_default_auth_mode(crm_client: TestClient) -> None:
     """A body with no auth_mode is a pre-direct-mode caller registering a
     vault reader — reinterpreting it as a D365 app registration would be
     silently wrong."""
-    resp = client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
+    resp = crm_client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
     assert resp.status_code == 200
     assert resp.json()["auth_mode"] == "key_vault"
 
 
-def test_register_direct_mode_then_get_masks_the_secret(client: TestClient) -> None:
-    resp = client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
+def test_register_direct_mode_then_get_masks_the_secret(crm_client: TestClient) -> None:
+    resp = crm_client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
     assert resp.status_code == 200
     body = resp.json()
     assert body["auth_mode"] == "direct"
@@ -100,30 +100,30 @@ def test_register_direct_mode_then_get_masks_the_secret(client: TestClient) -> N
     assert body["client_secret"] == "•••"
     assert "direct-secret-value" not in resp.text
 
-    get_resp = client.get("/geneco/credentials", headers=AUTH)
+    get_resp = crm_client.get("/geneco/credentials", headers=AUTH)
     assert get_resp.status_code == 200
     assert get_resp.json()["client_secret"] == "•••"
     assert "direct-secret-value" not in get_resp.text
 
 
-def test_get_echoes_only_the_active_modes_fields(client: TestClient) -> None:
-    client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
-    direct = client.get("/geneco/credentials", headers=AUTH).json()
+def test_get_echoes_only_the_active_modes_fields(crm_client: TestClient) -> None:
+    crm_client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
+    direct = crm_client.get("/geneco/credentials", headers=AUTH).json()
     assert "kv_client_id" not in direct
     assert "kv_client_secret" not in direct
 
-    client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
-    kv = client.get("/geneco/credentials", headers=AUTH).json()
+    crm_client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
+    kv = crm_client.get("/geneco/credentials", headers=AUTH).json()
     assert kv["auth_mode"] == "key_vault"
     assert "client_id" not in kv
     assert "client_secret" not in kv
 
 
 def test_switching_key_vault_to_direct_clears_the_vault_columns(
-    client: TestClient, settings: Settings
+    crm_client: TestClient, settings: Settings
 ) -> None:
-    client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
-    assert client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY).status_code == 200
+    crm_client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
+    assert crm_client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY).status_code == 200
 
     row = _row(settings)
     assert row["auth_mode"] == "direct"
@@ -136,10 +136,10 @@ def test_switching_key_vault_to_direct_clears_the_vault_columns(
 
 
 def test_switching_direct_to_key_vault_clears_the_direct_columns(
-    client: TestClient, settings: Settings
+    crm_client: TestClient, settings: Settings
 ) -> None:
-    client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
-    assert client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY).status_code == 200
+    crm_client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
+    assert crm_client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY).status_code == 200
 
     row = _row(settings)
     assert row["auth_mode"] == "key_vault"
@@ -151,32 +151,32 @@ def test_switching_direct_to_key_vault_clears_the_direct_columns(
 
 
 def test_neither_secret_is_ever_stored_in_plaintext(
-    client: TestClient, settings: Settings
+    crm_client: TestClient, settings: Settings
 ) -> None:
-    client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
+    crm_client.post("/geneco/credentials", headers=AUTH, json=DIRECT_BODY)
     assert DIRECT_BODY["client_secret"] not in _row(settings)["client_secret_encrypted"]
-    client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
+    crm_client.post("/geneco/credentials", headers=AUTH, json=CREDENTIALS_BODY)
     assert CREDENTIALS_BODY["kv_client_secret"] not in _row(settings)["kv_client_secret_encrypted"]
 
 
-def test_direct_mode_missing_its_own_fields_is_rejected(client: TestClient) -> None:
+def test_direct_mode_missing_its_own_fields_is_rejected(crm_client: TestClient) -> None:
     body = {k: v for k, v in DIRECT_BODY.items() if k != "client_secret"}
-    resp = client.post("/geneco/credentials", headers=AUTH, json=body)
+    resp = crm_client.post("/geneco/credentials", headers=AUTH, json=body)
     assert resp.status_code == 422
     assert "client_secret" in resp.text
 
 
-def test_key_vault_mode_missing_its_own_fields_is_rejected(client: TestClient) -> None:
+def test_key_vault_mode_missing_its_own_fields_is_rejected(crm_client: TestClient) -> None:
     body = {k: v for k, v in CREDENTIALS_BODY.items() if k != "kv_vault_url"}
-    resp = client.post("/geneco/credentials", headers=AUTH, json=body)
+    resp = crm_client.post("/geneco/credentials", headers=AUTH, json=body)
     assert resp.status_code == 422
     assert "kv_vault_url" in resp.text
 
 
-def test_a_body_carrying_the_other_modes_fields_is_rejected(client: TestClient) -> None:
+def test_a_body_carrying_the_other_modes_fields_is_rejected(crm_client: TestClient) -> None:
     """Both pairs at once would leave it ambiguous which app registration
     the caller meant — and would post a secret that has nowhere to go."""
-    resp = client.post(
+    resp = crm_client.post(
         "/geneco/credentials", headers=AUTH, json={**DIRECT_BODY, **{
             "kv_vault_url": CREDENTIALS_BODY["kv_vault_url"],
             "kv_client_id": CREDENTIALS_BODY["kv_client_id"],
@@ -187,18 +187,18 @@ def test_a_body_carrying_the_other_modes_fields_is_rejected(client: TestClient) 
     assert CREDENTIALS_BODY["kv_client_secret"] not in resp.text
 
 
-def test_an_unknown_auth_mode_is_rejected(client: TestClient) -> None:
-    resp = client.post(
+def test_an_unknown_auth_mode_is_rejected(crm_client: TestClient) -> None:
+    resp = crm_client.post(
         "/geneco/credentials", headers=AUTH, json={**DIRECT_BODY, "auth_mode": "sideways"}
     )
     assert resp.status_code == 422
 
 
-def test_a_rejected_body_never_echoes_the_secret_it_carried(client: TestClient) -> None:
+def test_a_rejected_body_never_echoes_the_secret_it_carried(crm_client: TestClient) -> None:
     """FastAPI's default 422 echoes the submitted input verbatim — which on
     this route means echoing the posted secret back, and into any log that
     captures response bodies."""
-    resp = client.post(
+    resp = crm_client.post(
         "/geneco/credentials", headers=AUTH, json={**CREDENTIALS_BODY, "org_url": "not-a-url"}
     )
     assert resp.status_code == 422
@@ -207,8 +207,8 @@ def test_a_rejected_body_never_echoes_the_secret_it_carried(client: TestClient) 
     assert "org_url" in resp.text
 
 
-def test_a_rejected_direct_body_never_echoes_its_secret(client: TestClient) -> None:
-    resp = client.post(
+def test_a_rejected_direct_body_never_echoes_its_secret(crm_client: TestClient) -> None:
+    resp = crm_client.post(
         "/geneco/credentials", headers=AUTH, json={**DIRECT_BODY, "org_url": "not-a-url"}
     )
     assert resp.status_code == 422

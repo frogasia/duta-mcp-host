@@ -34,6 +34,11 @@ VAULT_SCOPE = "https://vault.azure.net/.default"
 GENECO_CRM_CLIENT_ID_SECRET = "Crm-Client-Id"
 GENECO_CRM_CLIENT_SECRET_SECRET = "Crm-Client-Secret"
 
+#: Vault secret names holding the tenant's SSP (cxchat) Basic Auth pair.
+#: Fixed for the same reason as the CRM pair above.
+GENECO_SSP_USER_ID_SECRET = "Ssp-User-Id"
+GENECO_SSP_PASSWORD_SECRET = "Ssp-Password"
+
 
 class KeyVaultError(Exception):
     """``status_code``/``secret_name`` are carried structurally rather than
@@ -169,3 +174,9 @@ class KeyVaultClient:
         client_id = await self.get_secret(GENECO_CRM_CLIENT_ID_SECRET)
         client_secret = await self.get_secret(GENECO_CRM_CLIENT_SECRET_SECRET)
         return client_id, client_secret
+
+    async def get_ssp_credentials(self) -> tuple[str, str]:
+        """The tenant's SSP Basic Auth pair, as ``(username, password)``."""
+        username = await self.get_secret(GENECO_SSP_USER_ID_SECRET)
+        password = await self.get_secret(GENECO_SSP_PASSWORD_SECRET)
+        return username, password

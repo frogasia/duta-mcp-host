@@ -18,10 +18,10 @@ KV_URL = "https://geneco-kv.vault.azure.net"
 def _mock_vault() -> None:
     """Stub the vault hop that now sits in front of every D365 call."""
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(
-        return_value=Response(200, json={"value": "crm-client-id"})
+        return_value=Response(200, json={"value": "crm-crm_client-id"})
     )
     respx.get(f"{KV_URL}/secrets/Crm-Client-Secret").mock(
-        return_value=Response(200, json={"value": "crm-client-secret"})
+        return_value=Response(200, json={"value": "crm-crm_client-secret"})
     )
 
 
@@ -43,7 +43,7 @@ def _stub_tokens():
 
 
 def _rpc(
-    client: TestClient,
+    mcp: TestClient,
     tenant_slug: str,
     method: str,
     params: dict[str, Any] | None = None,
@@ -54,11 +54,12 @@ def _rpc(
         body["id"] = request_id
     if params is not None:
         body["params"] = params
-    return client.post(f"/{tenant_slug}", json=body)
+    return mcp.post(f"/{tenant_slug}", json=body)
 
 
-def _seed_credentials(client: TestClient, tenant_slug: str) -> None:
-    resp = client.post(
+def _seed_credentials(mcp: TestClient, tenant_slug: str) -> None:
+    """Register D365 credentials — always against the CRM server."""
+    resp = mcp.post(
         f"/{tenant_slug}/credentials",
         headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY},
         json={
@@ -72,9 +73,9 @@ def _seed_credentials(client: TestClient, tenant_slug: str) -> None:
     assert resp.status_code == 200
 
 
-def test_initialize_returns_protocol_info_and_session_header(client: TestClient) -> None:
+def test_initialize_returns_protocol_info_and_session_header(crm_client: TestClient) -> None:
     resp = _rpc(
-        client,
+        crm_client,
         "geneco",
         "initialize",
         {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}},
@@ -86,33 +87,77 @@ def test_initialize_returns_protocol_info_and_session_header(client: TestClient)
     assert "mcp-session-id" in {k.lower() for k in resp.headers}
 
 
-def test_notifications_initialized_returns_202_no_body(client: TestClient) -> None:
-    resp = client.post("/geneco", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+def test_notifications_initialized_returns_202_no_body(crm_client: TestClient) -> None:
+    resp = crm_client.post("/geneco", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert resp.status_code == 202
     assert resp.content == b""
 
 
-def test_tools_list_returns_all_tools(client: TestClient) -> None:
-    resp = _rpc(client, "geneco", "tools/list", {})
+def test_initialize_reports_the_crm_server_name(crm_client: TestClient) -> None:
+    """Two endpoints a client may hold registrations for at once must not
+    introduce themselves identically."""
+    resp = _rpc(crm_client, "geneco", "initialize", {})
+    assert resp.json()["result"]["serverInfo"]["name"] == "geneco-crm-mcp"
+
+
+def test_tools_list_is_empty_before_credentials_are_registered(crm_client: TestClient) -> None:
+    """A tenant mid-onboarding is offered nothing rather than tools whose
+    every call answers "not available for this workspace right now"."""
+    resp = _rpc(crm_client, "no-credentials-tenant", "tools/list", {})
+    assert resp.json()["result"]["tools"] == []
+
+
+def test_tools_list_returns_the_crm_tools_once_registered(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client, "geneco")
+    resp = _rpc(crm_client, "geneco", "tools/list", {})
     tools = {t["name"] for t in resp.json()["result"]["tools"]}
-    assert tools == {
-        "verify_account",
-        "create_support_case",
-        "get_support_cases",
-        "check_fee_waiver_status",
-        "check_recontract_eligibility",
-        "reverse_fee",
-        "request_password_reset",
-    }
+    assert tools == {"verify_account", "create_support_case", "get_support_cases"}
     for tool in resp.json()["result"]["tools"]:
         assert tool["inputSchema"]["type"] == "object"
 
 
-def test_tools_call_verify_account_no_credentials_is_honest_error(client: TestClient) -> None:
+def test_tools_list_goes_empty_again_when_credentials_are_revoked(
+    crm_client: TestClient,
+) -> None:
+    _seed_credentials(crm_client, "geneco")
+    crm_client.delete("/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY})
+    resp = _rpc(crm_client, "geneco", "tools/list", {})
+    assert resp.json()["result"]["tools"] == []
+
+
+def test_crm_tools_list_ignores_ssp_credentials(
+    crm_client: TestClient, ssp_client: TestClient
+) -> None:
+    """Registering one backend must not light up the other's tools — the
+    whole point of onboarding them separately."""
+    _seed_custom_api_credentials(ssp_client, "geneco")
+    assert _rpc(crm_client, "geneco", "tools/list", {}).json()["result"]["tools"] == []
+
+
+def test_crm_server_will_not_run_an_ssp_tool(
+    crm_client: TestClient, ssp_client: TestClient
+) -> None:
+    """An endpoint must never execute a tool it never advertised, even with
+    that tool's credentials registered on the other server."""
+    _seed_credentials(crm_client, "geneco")
+    _seed_custom_api_credentials(ssp_client, "geneco")
+    resp = _rpc(
+        crm_client,
+        "geneco",
+        "tools/call",
+        {"name": "check_fee_waiver_status", "arguments": {"account_number": "GC8063979W"}},
+    )
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    assert result["isError"] is True
+    assert "unknown tool" in result["content"][0]["text"]
+
+
+def test_tools_call_verify_account_no_credentials_is_honest_error(crm_client: TestClient) -> None:
     """No connector registered for this tenant at all — never a 500, never
     a fabricated result."""
     resp = _rpc(
-        client,
+        crm_client,
         "no-credentials-tenant",
         "tools/call",
         {"name": "verify_account", "arguments": {"account_id": "ACC1", "mobile_number": "0123456789"}},
@@ -124,8 +169,8 @@ def test_tools_call_verify_account_no_credentials_is_honest_error(client: TestCl
 
 
 @respx.mock
-def test_tools_call_verify_account_happy_path(client: TestClient) -> None:
-    _seed_credentials(client, "geneco")
+def test_tools_call_verify_account_happy_path(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client, "geneco")
     _mock_vault()
     respx.get(f"{ORG_URL}/api/data/v9.2/accounts").mock(
         return_value=Response(
@@ -135,7 +180,7 @@ def test_tools_call_verify_account_happy_path(client: TestClient) -> None:
     )
     with _stub_tokens():
         resp = _rpc(
-            client,
+            crm_client,
             "geneco",
             "tools/call",
             {"name": "verify_account", "arguments": {"account_id": "ACC1", "mobile_number": "0123456789"}},
@@ -146,16 +191,16 @@ def test_tools_call_verify_account_happy_path(client: TestClient) -> None:
 
 
 @respx.mock
-def test_tools_call_d365_failure_is_honest_error_not_5xx(client: TestClient) -> None:
+def test_tools_call_d365_failure_is_honest_error_not_5xx(crm_client: TestClient) -> None:
     """Regression test for the exact bug found in integration-hub: a D365
     connectivity failure must come back as a 200 + honest error, never an
     unhandled 500."""
-    _seed_credentials(client, "geneco")
+    _seed_credentials(crm_client, "geneco")
     _mock_vault()
     respx.get(f"{ORG_URL}/api/data/v9.2/accounts").mock(side_effect=httpx.ConnectError("boom"))
     with _stub_tokens():
         resp = _rpc(
-            client,
+            crm_client,
             "geneco",
             "tools/call",
             {"name": "verify_account", "arguments": {"account_id": "ACC1", "mobile_number": "0123456789"}},
@@ -167,15 +212,15 @@ def test_tools_call_d365_failure_is_honest_error_not_5xx(client: TestClient) -> 
 
 
 @respx.mock
-def test_tools_call_vault_failure_is_honest_error_not_5xx(client: TestClient) -> None:
+def test_tools_call_vault_failure_is_honest_error_not_5xx(crm_client: TestClient) -> None:
     """A tenant IS configured but its Key Vault can't be read — the D365
     credentials can't be resolved at all. Must still be a 200 + relayable
     error, never an unhandled 500 leaking out of the resolver."""
-    _seed_credentials(client, "geneco")
+    _seed_credentials(crm_client, "geneco")
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(side_effect=httpx.ConnectError("boom"))
     with _stub_tokens():
         resp = _rpc(
-            client,
+            crm_client,
             "geneco",
             "tools/call",
             {"name": "verify_account", "arguments": {"account_id": "ACC1", "mobile_number": "0123456789"}},
@@ -188,14 +233,14 @@ def test_tools_call_vault_failure_is_honest_error_not_5xx(client: TestClient) ->
 
 @respx.mock
 def test_tools_call_vault_failure_on_case_tools_is_honest_error_not_5xx(
-    client: TestClient,
+    crm_client: TestClient,
 ) -> None:
     """Same guarantee via the shared re-verify path in ``_common.py``."""
-    _seed_credentials(client, "geneco")
+    _seed_credentials(crm_client, "geneco")
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(return_value=Response(403, text="Forbidden"))
     with _stub_tokens():
         resp = _rpc(
-            client,
+            crm_client,
             "geneco",
             "tools/call",
             {
@@ -209,20 +254,20 @@ def test_tools_call_vault_failure_on_case_tools_is_honest_error_not_5xx(
     assert "error" in result["structuredContent"]
 
 
-def test_tools_call_unknown_tool_is_honest_error(client: TestClient) -> None:
-    resp = _rpc(client, "geneco", "tools/call", {"name": "not_a_tool", "arguments": {}})
+def test_tools_call_unknown_tool_is_honest_error(crm_client: TestClient) -> None:
+    resp = _rpc(crm_client, "geneco", "tools/call", {"name": "not_a_tool", "arguments": {}})
     result = resp.json()["result"]
     assert result["isError"] is True
 
 
-def test_tools_call_invalid_arguments_is_honest_error(client: TestClient) -> None:
-    resp = _rpc(client, "geneco", "tools/call", {"name": "verify_account", "arguments": {}})
+def test_tools_call_invalid_arguments_is_honest_error(crm_client: TestClient) -> None:
+    resp = _rpc(crm_client, "geneco", "tools/call", {"name": "verify_account", "arguments": {}})
     result = resp.json()["result"]
     assert result["isError"] is True
 
 
-def test_unknown_method_returns_jsonrpc_error(client: TestClient) -> None:
-    resp = _rpc(client, "geneco", "not/a/method")
+def test_unknown_method_returns_jsonrpc_error(crm_client: TestClient) -> None:
+    resp = _rpc(crm_client, "geneco", "not/a/method")
     body = resp.json()
     assert body["error"]["code"] == -32601
 
@@ -230,9 +275,11 @@ def test_unknown_method_returns_jsonrpc_error(client: TestClient) -> None:
 CUSTOM_API_URL = "https://custom-api.geneco.example"
 
 
-def _seed_custom_api_credentials(client: TestClient, tenant_slug: str) -> None:
-    resp = client.post(
-        f"/{tenant_slug}/custom-api-credentials",
+def _seed_custom_api_credentials(mcp: TestClient, tenant_slug: str) -> None:
+    """Register SSP credentials — always against the SSP server, whose
+    ``credentials`` path is its own, not the CRM server's."""
+    resp = mcp.post(
+        f"/{tenant_slug}/credentials",
         headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY},
         json={"base_url": CUSTOM_API_URL, "username": "cxchat-svc", "password": "s1"},
     )
@@ -240,10 +287,10 @@ def _seed_custom_api_credentials(client: TestClient, tenant_slug: str) -> None:
 
 
 def test_tools_call_check_fee_waiver_status_no_credentials_is_honest_error(
-    client: TestClient,
+    ssp_client: TestClient,
 ) -> None:
     resp = _rpc(
-        client,
+        ssp_client,
         "no-credentials-tenant",
         "tools/call",
         {"name": "check_fee_waiver_status", "arguments": {"account_number": "GC8063979W"}},
@@ -255,8 +302,8 @@ def test_tools_call_check_fee_waiver_status_no_credentials_is_honest_error(
 
 
 @respx.mock
-def test_tools_call_check_fee_waiver_status_happy_path(client: TestClient) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+def test_tools_call_check_fee_waiver_status_happy_path(ssp_client: TestClient) -> None:
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/cxchat/v2/feewaiver").mock(
         return_value=Response(
             200,
@@ -267,7 +314,7 @@ def test_tools_call_check_fee_waiver_status_happy_path(client: TestClient) -> No
         )
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "check_fee_waiver_status", "arguments": {"account_number": "GC8063979W"}},
@@ -282,14 +329,14 @@ def test_tools_call_check_fee_waiver_status_happy_path(client: TestClient) -> No
 
 @respx.mock
 def test_tools_call_check_fee_waiver_status_failure_is_honest_error_not_5xx(
-    client: TestClient,
+    ssp_client: TestClient,
 ) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/cxchat/v2/feewaiver").mock(
         side_effect=httpx.ConnectError("boom")
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "check_fee_waiver_status", "arguments": {"account_number": "GC8063979W"}},
@@ -301,10 +348,10 @@ def test_tools_call_check_fee_waiver_status_failure_is_honest_error_not_5xx(
 
 
 def test_tools_call_check_recontract_eligibility_no_credentials_is_honest_error(
-    client: TestClient,
+    ssp_client: TestClient,
 ) -> None:
     resp = _rpc(
-        client,
+        ssp_client,
         "no-credentials-tenant",
         "tools/call",
         {"name": "check_recontract_eligibility", "arguments": {"account_number": "GC8063979W"}},
@@ -316,8 +363,8 @@ def test_tools_call_check_recontract_eligibility_no_credentials_is_honest_error(
 
 
 @respx.mock
-def test_tools_call_check_recontract_eligibility_happy_path(client: TestClient) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+def test_tools_call_check_recontract_eligibility_happy_path(ssp_client: TestClient) -> None:
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/cxchat/v2/checkrecontracteligibility").mock(
         return_value=Response(
             200,
@@ -325,7 +372,7 @@ def test_tools_call_check_recontract_eligibility_happy_path(client: TestClient) 
         )
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "check_recontract_eligibility", "arguments": {"account_number": "GC8063979W"}},
@@ -338,14 +385,14 @@ def test_tools_call_check_recontract_eligibility_happy_path(client: TestClient) 
 
 @respx.mock
 def test_tools_call_check_recontract_eligibility_failure_is_honest_error_not_5xx(
-    client: TestClient,
+    ssp_client: TestClient,
 ) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/cxchat/v2/checkrecontracteligibility").mock(
         side_effect=httpx.ConnectError("boom")
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "check_recontract_eligibility", "arguments": {"account_number": "GC8063979W"}},
@@ -356,9 +403,9 @@ def test_tools_call_check_recontract_eligibility_failure_is_honest_error_not_5xx
     assert "error" in result["structuredContent"]
 
 
-def test_tools_call_reverse_fee_no_credentials_is_honest_error(client: TestClient) -> None:
+def test_tools_call_reverse_fee_no_credentials_is_honest_error(ssp_client: TestClient) -> None:
     resp = _rpc(
-        client,
+        ssp_client,
         "no-credentials-tenant",
         "tools/call",
         {"name": "reverse_fee", "arguments": {"account_number": "GC8063979W"}},
@@ -370,8 +417,8 @@ def test_tools_call_reverse_fee_no_credentials_is_honest_error(client: TestClien
 
 
 @respx.mock
-def test_tools_call_reverse_fee_happy_path(client: TestClient) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+def test_tools_call_reverse_fee_happy_path(ssp_client: TestClient) -> None:
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/cxchat/v2/feereversal").mock(
         return_value=Response(
             200,
@@ -379,7 +426,7 @@ def test_tools_call_reverse_fee_happy_path(client: TestClient) -> None:
         )
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "reverse_fee", "arguments": {"account_number": "GC8063979W"}},
@@ -391,13 +438,13 @@ def test_tools_call_reverse_fee_happy_path(client: TestClient) -> None:
 
 
 @respx.mock
-def test_tools_call_reverse_fee_failure_is_honest_error_not_5xx(client: TestClient) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+def test_tools_call_reverse_fee_failure_is_honest_error_not_5xx(ssp_client: TestClient) -> None:
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/cxchat/v2/feereversal").mock(
         side_effect=httpx.ConnectError("boom")
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "reverse_fee", "arguments": {"account_number": "GC8063979W"}},
@@ -409,10 +456,10 @@ def test_tools_call_reverse_fee_failure_is_honest_error_not_5xx(client: TestClie
 
 
 def test_tools_call_request_password_reset_no_credentials_is_honest_error(
-    client: TestClient,
+    ssp_client: TestClient,
 ) -> None:
     resp = _rpc(
-        client,
+        ssp_client,
         "no-credentials-tenant",
         "tools/call",
         {"name": "request_password_reset", "arguments": {"email": "customer@example.com"}},
@@ -424,15 +471,15 @@ def test_tools_call_request_password_reset_no_credentials_is_honest_error(
 
 
 @respx.mock
-def test_tools_call_request_password_reset_happy_path(client: TestClient) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+def test_tools_call_request_password_reset_happy_path(ssp_client: TestClient) -> None:
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/forgotpasswordv2").mock(
         return_value=Response(
             200, json={"SuccessCode": "200", "Message": "Password Reset Instructions Sent"}
         )
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "request_password_reset", "arguments": {"email": "customer@example.com"}},
@@ -444,11 +491,11 @@ def test_tools_call_request_password_reset_happy_path(client: TestClient) -> Non
 
 
 @respx.mock
-def test_tools_call_request_password_reset_declined_is_not_an_error(client: TestClient) -> None:
+def test_tools_call_request_password_reset_declined_is_not_an_error(ssp_client: TestClient) -> None:
     """The vendor's own decline (e.g. unregistered email) is a normal tool
     result, not a tool error — only a real connector failure sets
     isError."""
-    _seed_custom_api_credentials(client, "geneco")
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/forgotpasswordv2").mock(
         return_value=Response(
             502,
@@ -460,7 +507,7 @@ def test_tools_call_request_password_reset_declined_is_not_an_error(client: Test
         )
     )
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "request_password_reset", "arguments": {"email": "unregistered@example.com"}},
@@ -473,12 +520,12 @@ def test_tools_call_request_password_reset_declined_is_not_an_error(client: Test
 
 @respx.mock
 def test_tools_call_request_password_reset_failure_is_honest_error_not_5xx(
-    client: TestClient,
+    ssp_client: TestClient,
 ) -> None:
-    _seed_custom_api_credentials(client, "geneco")
+    _seed_custom_api_credentials(ssp_client, "geneco")
     respx.post(f"{CUSTOM_API_URL}/api/forgotpasswordv2").mock(side_effect=httpx.ConnectError("boom"))
     resp = _rpc(
-        client,
+        ssp_client,
         "geneco",
         "tools/call",
         {"name": "request_password_reset", "arguments": {"email": "customer@example.com"}},
@@ -487,3 +534,57 @@ def test_tools_call_request_password_reset_failure_is_honest_error_not_5xx(
     result = resp.json()["result"]
     assert result["isError"] is True
     assert "error" in result["structuredContent"]
+
+
+def test_ssp_initialize_reports_the_ssp_server_name(ssp_client: TestClient) -> None:
+    resp = _rpc(ssp_client, "geneco", "initialize", {})
+    assert resp.json()["result"]["serverInfo"]["name"] == "geneco-ssp-mcp"
+
+
+def test_ssp_tools_list_is_empty_before_credentials_are_registered(
+    ssp_client: TestClient,
+) -> None:
+    resp = _rpc(ssp_client, "no-credentials-tenant", "tools/list", {})
+    assert resp.json()["result"]["tools"] == []
+
+
+def test_ssp_tools_list_returns_the_ssp_tools_once_registered(ssp_client: TestClient) -> None:
+    _seed_custom_api_credentials(ssp_client, "geneco")
+    resp = _rpc(ssp_client, "geneco", "tools/list", {})
+    tools = {t["name"] for t in resp.json()["result"]["tools"]}
+    assert tools == {
+        "check_fee_waiver_status",
+        "check_recontract_eligibility",
+        "reverse_fee",
+        "request_password_reset",
+    }
+
+
+def test_ssp_tools_appear_independently_of_the_crm_stage(
+    ssp_client: TestClient, crm_client: TestClient
+) -> None:
+    """The staged case this split exists for: SSP credentials arrive first,
+    and its tools work while CRM is still unregistered."""
+    _seed_custom_api_credentials(ssp_client, "geneco")
+    assert len(_rpc(ssp_client, "geneco", "tools/list", {}).json()["result"]["tools"]) == 4
+    assert _rpc(crm_client, "geneco", "tools/list", {}).json()["result"]["tools"] == []
+
+    _seed_credentials(crm_client, "geneco")
+    assert len(_rpc(ssp_client, "geneco", "tools/list", {}).json()["result"]["tools"]) == 4
+    assert len(_rpc(crm_client, "geneco", "tools/list", {}).json()["result"]["tools"]) == 3
+
+
+def test_ssp_server_will_not_run_a_crm_tool(
+    ssp_client: TestClient, crm_client: TestClient
+) -> None:
+    _seed_credentials(crm_client, "geneco")
+    resp = _rpc(
+        ssp_client,
+        "geneco",
+        "tools/call",
+        {"name": "verify_account", "arguments": {"account_id": "ACC1", "mobile_number": "0123456789"}},
+    )
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    assert result["isError"] is True
+    assert "unknown tool" in result["content"][0]["text"]

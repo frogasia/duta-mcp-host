@@ -17,24 +17,35 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from geneco_mcp.store.crm_resolver import CrmCredentialCache
+from geneco_mcp.store.ssp_resolver import SspCredentialCache
+
+#: Which backend a tool talks to, and therefore which credential kind it
+#: needs and which MCP sub-app serves it. Declared per tool rather than
+#: derived from the tool's name: the registered names are bare
+#: (``verify_account``, ``check_fee_waiver_status``), and only the *module*
+#: names carry a ``crm_``/``api_`` prefix — so a name-based split would be
+#: a rule nothing enforces the day someone adds a tool.
+ToolKind = Literal["crm", "ssp"]
 
 
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     """Per-call dependencies handed to every tool handler: the request's DB
     session, the encryption key needed to decrypt whichever credential kind
-    the tool actually uses, and the process-local cache of vault-fetched
-    D365 credentials (empty and unused for tools that don't touch D365)."""
+    the tool actually uses, and the process-local caches of vault-fetched
+    credentials — one per backend, each empty and unused for tools that
+    don't reach that backend."""
 
     session: AsyncSession
     encryption_key: str
     crm_cache: CrmCredentialCache
+    ssp_cache: SspCredentialCache
 
 
 ToolHandler = Callable[[ToolContext, str, BaseModel], Awaitable[dict[str, Any]]]
@@ -43,6 +54,7 @@ ToolHandler = Callable[[ToolContext, str, BaseModel], Awaitable[dict[str, Any]]]
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
+    kind: ToolKind
     description: str
     input_model: type[BaseModel]
     handler: ToolHandler
@@ -52,13 +64,13 @@ _REGISTRY: dict[str, ToolSpec] = {}
 
 
 def register(
-    name: str, *, description: str, input_model: type[BaseModel]
+    name: str, *, kind: ToolKind, description: str, input_model: type[BaseModel]
 ) -> Callable[[ToolHandler], ToolHandler]:
     def decorator(fn: ToolHandler) -> ToolHandler:
         if name in _REGISTRY:
             raise ValueError(f"tool {name!r} already registered")
         _REGISTRY[name] = ToolSpec(
-            name=name, description=description, input_model=input_model, handler=fn
+            name=name, kind=kind, description=description, input_model=input_model, handler=fn
         )
         return fn
 
@@ -67,6 +79,13 @@ def register(
 
 def all_tools() -> tuple[ToolSpec, ...]:
     return tuple(_REGISTRY.values())
+
+
+def tools_for_kind(kind: ToolKind) -> tuple[ToolSpec, ...]:
+    """The tools one MCP sub-app serves. The registry itself stays whole —
+    it is populated once at import, and each app filters a view out of it,
+    so two apps in one process never contend over registration."""
+    return tuple(spec for spec in _REGISTRY.values() if spec.kind == kind)
 
 
 def get_tool(name: str) -> ToolSpec | None:

@@ -30,10 +30,10 @@ AUTH = {"X-Admin-Api-Key": TEST_ADMIN_API_KEY}
 
 def _mock_vault() -> respx.Route:
     id_route = respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(
-        return_value=Response(200, json={"value": "crm-client-id"})
+        return_value=Response(200, json={"value": "crm-crm_client-id"})
     )
     respx.get(f"{KV_URL}/secrets/Crm-Client-Secret").mock(
-        return_value=Response(200, json={"value": "crm-client-secret"})
+        return_value=Response(200, json={"value": "crm-crm_client-secret"})
     )
     return id_route
 
@@ -63,8 +63,8 @@ def _stub_tokens():
         yield
 
 
-def _seed_credentials(client: TestClient, tenant_slug: str = "geneco") -> None:
-    resp = client.post(
+def _seed_credentials(crm_client: TestClient, tenant_slug: str = "geneco") -> None:
+    resp = crm_client.post(
         f"/{tenant_slug}/credentials",
         headers=AUTH,
         json={
@@ -78,8 +78,8 @@ def _seed_credentials(client: TestClient, tenant_slug: str = "geneco") -> None:
     assert resp.status_code == 200
 
 
-def _seed_direct_credentials(client: TestClient, tenant_slug: str = "geneco") -> None:
-    resp = client.post(
+def _seed_direct_credentials(crm_client: TestClient, tenant_slug: str = "geneco") -> None:
+    resp = crm_client.post(
         f"/{tenant_slug}/credentials",
         headers=AUTH,
         json={
@@ -94,13 +94,13 @@ def _seed_direct_credentials(client: TestClient, tenant_slug: str = "geneco") ->
 
 
 @respx.mock
-def test_happy_path_reports_ok_with_the_org_that_answered(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_happy_path_reports_ok_with_the_org_that_answered(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
     _mock_vault()
     _mock_whoami()
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -109,41 +109,41 @@ def test_happy_path_reports_ok_with_the_org_that_answered(client: TestClient) ->
     assert isinstance(body["latency_ms"], int)
 
 
-def test_verify_requires_admin_key(client: TestClient) -> None:
-    _seed_credentials(client)
-    assert client.post("/geneco/credentials/verify").status_code == 401
+def test_verify_requires_admin_key(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
+    assert crm_client.post("/geneco/credentials/verify").status_code == 401
 
 
-def test_verify_rejects_wrong_admin_key(client: TestClient) -> None:
-    _seed_credentials(client)
-    resp = client.post("/geneco/credentials/verify", headers={"X-Admin-Api-Key": "wrong-key"})
+def test_verify_rejects_wrong_admin_key(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
+    resp = crm_client.post("/geneco/credentials/verify", headers={"X-Admin-Api-Key": "wrong-key"})
     assert resp.status_code == 401
 
 
-def test_unregistered_tenant_is_404(client: TestClient) -> None:
-    resp = client.post("/unknown-tenant/credentials/verify", headers=AUTH)
+def test_unregistered_tenant_is_404(crm_client: TestClient) -> None:
+    resp = crm_client.post("/unknown-tenant/credentials/verify", headers=AUTH)
     assert resp.status_code == 404
 
 
 @respx.mock
-def test_vault_unreachable_is_200_not_5xx(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_vault_unreachable_is_200_not_5xx(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(side_effect=httpx.ConnectError("boom"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is False
 
 
 @respx.mock
-def test_vault_403_explains_the_access_policy(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_vault_403_explains_the_access_policy(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(return_value=Response(403, text="Forbidden"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -153,12 +153,12 @@ def test_vault_403_explains_the_access_policy(client: TestClient) -> None:
 
 
 @respx.mock
-def test_missing_vault_secret_says_so(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_missing_vault_secret_says_so(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(return_value=Response(404, text="NotFound"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -168,14 +168,14 @@ def test_missing_vault_secret_says_so(client: TestClient) -> None:
 
 @respx.mock
 def test_d365_rejecting_the_token_is_200_with_an_application_user_hint(
-    client: TestClient,
+    crm_client: TestClient,
 ) -> None:
-    _seed_credentials(client)
+    _seed_credentials(crm_client)
     _mock_vault()
     _mock_whoami(Response(403, text="Forbidden"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -184,13 +184,13 @@ def test_d365_rejecting_the_token_is_200_with_an_application_user_hint(
 
 
 @respx.mock
-def test_d365_unreachable_is_200_not_5xx(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_d365_unreachable_is_200_not_5xx(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
     _mock_vault()
     respx.get(WHOAMI_URL).mock(side_effect=httpx.ConnectError("boom"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -199,31 +199,31 @@ def test_d365_unreachable_is_200_not_5xx(client: TestClient) -> None:
 
 
 @respx.mock
-def test_verify_never_exposes_a_secret_value(client: TestClient) -> None:
+def test_verify_never_exposes_a_secret_value(crm_client: TestClient) -> None:
     """Neither the stored vault secret nor the vault-fetched D365 one may
     appear anywhere in the response."""
-    _seed_credentials(client)
+    _seed_credentials(crm_client)
     _mock_vault()
     _mock_whoami()
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     assert VAULT_SECRET not in resp.text
-    assert "crm-client-secret" not in resp.text
+    assert "crm-crm_client-secret" not in resp.text
 
 
 @respx.mock
-def test_verify_never_exposes_a_secret_value_on_failure(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_verify_never_exposes_a_secret_value_on_failure(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
     # A vault that echoes something secret-shaped back in its error body.
     respx.get(f"{KV_URL}/secrets/Crm-Client-Id").mock(
         return_value=Response(500, text=f"upstream said {VAULT_SECRET}")
     )
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is False
@@ -231,22 +231,22 @@ def test_verify_never_exposes_a_secret_value_on_failure(client: TestClient) -> N
 
 
 @respx.mock
-def test_verify_bypasses_the_credential_cache(client: TestClient) -> None:
+def test_verify_bypasses_the_credential_cache(crm_client: TestClient) -> None:
     """A verify served from the cached D365 app registration would prove
     nothing about the vault *now*, so every verify re-reads it."""
-    _seed_credentials(client)
+    _seed_credentials(crm_client)
     id_route = _mock_vault()
     _mock_whoami()
 
     with _stub_tokens():
-        client.post("/geneco/credentials/verify", headers=AUTH)
-        client.post("/geneco/credentials/verify", headers=AUTH)
+        crm_client.post("/geneco/credentials/verify", headers=AUTH)
+        crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert id_route.call_count == 2
 
 
-def test_a_hanging_backend_times_out_as_ok_false(client: TestClient) -> None:
-    _seed_credentials(client)
+def test_a_hanging_backend_times_out_as_ok_false(crm_client: TestClient) -> None:
+    _seed_credentials(crm_client)
 
     async def _hang(*_args, **_kwargs):
         await asyncio.sleep(5)
@@ -255,7 +255,7 @@ def test_a_hanging_backend_times_out_as_ok_false(client: TestClient) -> None:
         patch("geneco_mcp.protocol.admin_router.VERIFY_TIMEOUT_SECONDS", 0.05),
         patch("geneco_mcp.store.crm_resolver.CrmCredentialResolver.get_connector", _hang),
     ):
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -263,16 +263,16 @@ def test_a_hanging_backend_times_out_as_ok_false(client: TestClient) -> None:
     assert "Timed out" in body["detail"]
 
 
-def test_an_unexpected_error_is_still_200(client: TestClient) -> None:
+def test_an_unexpected_error_is_still_200(crm_client: TestClient) -> None:
     """The last net: even a bug in the check itself must not 5xx an admin's
     'Test connection' click."""
-    _seed_credentials(client)
+    _seed_credentials(crm_client)
 
     async def _boom(*_args, **_kwargs):
         raise RuntimeError("unexpected")
 
     with patch("geneco_mcp.store.crm_resolver.CrmCredentialResolver.get_connector", _boom):
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -281,14 +281,14 @@ def test_an_unexpected_error_is_still_200(client: TestClient) -> None:
 
 
 @respx.mock
-def test_direct_mode_verifies_without_touching_key_vault(client: TestClient) -> None:
+def test_direct_mode_verifies_without_touching_key_vault(crm_client: TestClient) -> None:
     """Only WhoAmI is mocked — respx fails any unmocked request, so a vault
     hop here would fail this test rather than pass it silently."""
-    _seed_direct_credentials(client)
+    _seed_direct_credentials(crm_client)
     _mock_whoami()
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -300,15 +300,15 @@ def test_direct_mode_verifies_without_touching_key_vault(client: TestClient) -> 
 
 @respx.mock
 def test_direct_mode_403_names_the_registered_app_not_the_vault_secret(
-    client: TestClient,
+    crm_client: TestClient,
 ) -> None:
     """``Crm-Client-Id`` is a vault secret that is not in play for a direct
     tenant — naming it would send an admin looking for the wrong thing."""
-    _seed_direct_credentials(client)
+    _seed_direct_credentials(crm_client)
     _mock_whoami(Response(403, text="Forbidden"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -319,12 +319,12 @@ def test_direct_mode_403_names_the_registered_app_not_the_vault_secret(
 
 
 @respx.mock
-def test_direct_mode_unreachable_org_is_200_not_5xx(client: TestClient) -> None:
-    _seed_direct_credentials(client)
+def test_direct_mode_unreachable_org_is_200_not_5xx(crm_client: TestClient) -> None:
+    _seed_direct_credentials(crm_client)
     respx.get(WHOAMI_URL).mock(side_effect=httpx.ConnectError("boom"))
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -333,30 +333,30 @@ def test_direct_mode_unreachable_org_is_200_not_5xx(client: TestClient) -> None:
 
 
 @respx.mock
-def test_direct_mode_verify_never_exposes_the_stored_secret(client: TestClient) -> None:
-    _seed_direct_credentials(client)
+def test_direct_mode_verify_never_exposes_the_stored_secret(crm_client: TestClient) -> None:
+    _seed_direct_credentials(crm_client)
     _mock_whoami()
 
     with _stub_tokens():
-        resp = client.post("/geneco/credentials/verify", headers=AUTH)
+        resp = crm_client.post("/geneco/credentials/verify", headers=AUTH)
 
     assert resp.status_code == 200
     assert DIRECT_SECRET not in resp.text
 
 
 @respx.mock
-def test_verify_follows_a_tenant_that_switches_mode(client: TestClient) -> None:
+def test_verify_follows_a_tenant_that_switches_mode(crm_client: TestClient) -> None:
     """Re-registering in the other mode must change which hops verify makes,
     not just what is stored."""
-    _seed_credentials(client)
+    _seed_credentials(crm_client)
     _mock_vault()
     _mock_whoami()
     with _stub_tokens():
-        assert client.post("/geneco/credentials/verify", headers=AUTH).json()["ok"] is True
+        assert crm_client.post("/geneco/credentials/verify", headers=AUTH).json()["ok"] is True
 
-    _seed_direct_credentials(client)
+    _seed_direct_credentials(crm_client)
     with _stub_tokens():
-        body = client.post("/geneco/credentials/verify", headers=AUTH).json()
+        body = crm_client.post("/geneco/credentials/verify", headers=AUTH).json()
 
     assert body["ok"] is True
     assert "Key Vault" not in body["detail"]

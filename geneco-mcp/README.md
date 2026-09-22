@@ -1,16 +1,33 @@
 # geneco-mcp
 
-An MCP server hosting seven tools for duta-ilmu's orchestrator to call:
+**Two** MCP servers over one codebase, one per backend, for duta-ilmu's
+orchestrator to call:
+
+**`geneco-crm-mcp`** — D365/Dataverse:
 
 | Tool | What it does |
 |---|---|
 | `verify_account` | Account inquiry — confirms an `account_id`/`mobile_number` pair, returns the account holder's name and balance. |
 | `create_support_case` | Create case — re-verifies the account, then creates a D365 incident. |
 | `get_support_cases` | Case inquiry — re-verifies the account, then lists its recent D365 incidents. |
-| `check_fee_waiver_status` | Fee waiver inquiry — looks up an account's fee waiver contract lines (ETF, APDF, LPC, PF) against the custom cxchat API. |
-| `check_recontract_eligibility` | Re-contract eligibility check — looks up whether an account is eligible to re-contract, against the custom cxchat API. |
-| `reverse_fee` | Fee reversal — reverses the applicable fees for an account, against the custom cxchat API. |
-| `request_password_reset` | Self-service-portal password reset — sends a password-reset email for a registered account email address, against the custom cxchat API. |
+
+**`geneco-ssp-mcp`** — Geneco's self-service portal (the custom cxchat API):
+
+| Tool | What it does |
+|---|---|
+| `check_fee_waiver_status` | Fee waiver inquiry — looks up an account's fee waiver contract lines (ETF, APDF, LPC, PF). |
+| `check_recontract_eligibility` | Re-contract eligibility check — looks up whether an account is eligible to re-contract. |
+| `reverse_fee` | Fee reversal — reverses the applicable fees for an account. |
+| `request_password_reset` | Password reset — sends a password-reset email for a registered account email address. |
+
+**Why two servers and not one.** The two backends are onboarded at
+different times: a tenant's D365 credentials can land weeks before its
+SSP ones, or the other way round. Two endpoints means the portal can
+register and enable each connector the moment its own credentials exist,
+instead of holding one registration back until both halves are ready. The
+code below the endpoints is shared — same database, same deployment, one
+`kind` argument (`app/main.py`) picking which tools and which
+credential-intake body each server carries.
 
 This service owns its own connectors and credential storage — D365/Dataverse
 (`app/clients/d365_connector.py`) and the custom fee-waiver API
@@ -50,15 +67,22 @@ Every path below is relative to a base that depends on how the service is
 running, and getting this wrong is the most common way to waste an
 afternoon (you get a `404 {"detail":"Not Found"}`, not a helpful error):
 
-| Running as | Base URL |
-|---|---|
-| Standalone (`make run`, this README's quickstart) | `http://localhost:8000` |
-| Behind the gateway (`Dockerfile`/`docker-compose`, i.e. **every real deployment**) | `http://<host>/geneco-mcp` |
+| Running as | CRM base URL | SSP base URL |
+|---|---|---|
+| Standalone (`make run`, this README's quickstart) | `http://localhost:8000` | `http://localhost:8001` |
+| Behind the gateway (`Dockerfile`/`docker-compose`, i.e. **every real deployment**) | `http://<host>/geneco-crm-mcp` | `http://<host>/geneco-ssp-mcp` |
 
-The gateway mounts this app under `/geneco-mcp` (see `gateway.py`'s
-`SUB_APPS`), so a tenant's MCP endpoint in production is
-`https://<host>/geneco-mcp/{tenant_slug}`. Examples below use the
-standalone form; prepend `/geneco-mcp` if you're talking to the gateway.
+The gateway mounts the app twice (see `gateway.py`'s `SUB_APPS`), so a
+tenant's MCP endpoints in production are
+`https://<host>/geneco-crm-mcp/{tenant_slug}` and
+`https://<host>/geneco-ssp-mcp/{tenant_slug}`. Standalone,
+`python -m geneco_mcp.run crm|ssp` runs one server at a time, unmounted,
+on the ports above.
+
+**The two servers share every path.** Which backend you are talking to is
+carried by the prefix alone — `/{tenant_slug}/credentials` means D365
+under one and the SSP API under the other, and the bodies differ
+accordingly. Posting one server's body to the other is a `422`.
 
 `{tenant_slug}` is a free-form identifier **you choose** when registering
 a tenant — it is not validated against anything and never leaves this
@@ -75,7 +99,9 @@ the Pydantic models):
 <base>/openapi.json    # machine-readable schema
 ```
 
-e.g. `http://localhost:8123/geneco-mcp/api/docs` behind the gateway. Use
+e.g. `http://localhost:8123/geneco-crm-mcp/api/docs` behind the gateway
+(and `.../geneco-ssp-mcp/api/docs` for the other server — each documents
+only its own routes). Use
 that as the authoritative endpoint/field reference; the rest of this
 README covers the things a schema can't express — prerequisites, the
 error convention, and how the pieces fit together.
@@ -86,16 +112,21 @@ error convention, and how the pieces fit together.
 one pair of endpoints per connector kind:
 
 ```
-POST   /{tenant_slug}/credentials   # register/replace a tenant's D365 credentials (either auth_mode)
-GET    /{tenant_slug}/credentials   # confirm what's registered (the secret is always masked)
-DELETE /{tenant_slug}/credentials   # revoke
-
+# geneco-crm-mcp — D365 credentials (either auth_mode)
+POST   /{tenant_slug}/credentials          # register/replace
+GET    /{tenant_slug}/credentials          # confirm what's registered (the secret is always masked)
+DELETE /{tenant_slug}/credentials          # revoke
 POST   /{tenant_slug}/credentials/verify   # prove the registered credentials actually work
 
-POST   /{tenant_slug}/custom-api-credentials   # register/replace the custom API's Basic Auth creds
-GET    /{tenant_slug}/custom-api-credentials   # confirm what's registered (password always masked)
-DELETE /{tenant_slug}/custom-api-credentials   # revoke
+# geneco-ssp-mcp — the SSP API's Basic Auth credentials
+POST   /{tenant_slug}/credentials          # register/replace
+GET    /{tenant_slug}/credentials          # confirm what's registered (password always masked)
+DELETE /{tenant_slug}/credentials          # revoke
+POST   /{tenant_slug}/credentials/verify   # prove the registered credentials actually work
 ```
+
+Both servers have a `verify`, but they do not promise the same thing —
+see [Verifying a registration](#verifying-a-registration).
 
 ### Before you register a D365 tenant
 
@@ -178,7 +209,7 @@ The custom API has no vault — its Basic Auth credentials are stored
 directly:
 
 ```bash
-curl -s -X POST localhost:8000/geneco/custom-api-credentials \
+curl -s -X POST localhost:8001/geneco/credentials \
   -H 'Content-Type: application/json' \
   -H 'X-Admin-Api-Key: dev-admin-key' \
   -d '{
@@ -268,6 +299,39 @@ app registration (a verify served from cache would prove nothing about
 the vault *now*), so the next tool call for that tenant pays one extra
 vault round-trip; and the whole check is bounded at 8 seconds.
 
+#### Verifying SSP credentials
+
+The SSP server answers the same shape at the same path, bypasses its own
+cache the same way, and is bounded by the same 8 seconds — but it cannot
+promise as much, and says so rather than guessing.
+
+Dataverse has `WhoAmI`; the SSP API has no ping endpoint at all. So the
+check is a real **read-only `feewaiver` lookup** — never `feereversal`
+(it moves a customer's money) and never `forgotpasswordv2` (it emails a
+real customer, and answers business declines with HTTP 502, which is
+useless as an auth signal). A lookup needs an account number, which is
+where the two levels of confidence come from:
+
+```bash
+# Conclusive — proves vault (if any), Basic Auth, and a live lookup
+curl -s -X POST localhost:8001/geneco/credentials/verify \
+  -H 'X-Admin-Api-Key: dev-admin-key' -H 'Content-Type: application/json' \
+  -d '{"account_number": "<a real account in this tenant>"}'
+
+# No body — still catches wrong credentials, but cannot fully confirm good ones
+curl -s -X POST localhost:8001/geneco/credentials/verify \
+  -H 'X-Admin-Api-Key: dev-admin-key'
+```
+
+Without an `account_number` a probe value is sent. A `401`/`403` still
+proves the credentials are **wrong** — the case worth catching before a
+tenant goes live. But any other 4xx is indistinguishable from "no such
+account", so it comes back `ok: false` with a detail asking for a real
+account number, never a false green and never a claim the credentials
+were rejected. Callers that need the strong guarantee — duta-ilmu's
+portal, before registering tools with the assistant — should always pass
+one.
+
 **Stage 2 — the MCP protocol face**, matching exactly what duta-ilmu's
 orchestrator MCP client speaks
 (`services/orchestrator/src/orchestrator/tools/mcp.py`): JSON-RPC
@@ -279,7 +343,22 @@ POST /{tenant_slug}
 
 `tenant_slug` is a URL path parameter, not hardcoded — any tenant with
 credentials registered via stage 1 can point its MCP config at
-`.../geneco-mcp/{their_slug}`.
+`.../geneco-crm-mcp/{their_slug}` or `.../geneco-ssp-mcp/{their_slug}`.
+
+**`tools/list` is credential-gated.** A server advertises its tools only
+once that tenant has registered the credentials behind them; before that
+it returns `{"tools": []}`. So a tenant mid-onboarding is offered nothing
+rather than tools whose every call would answer "not available for this
+workspace right now" — and the list fills in by itself the moment stage 1
+lands, with no restart. Registering one backend never lights up the
+other's tools, and neither server will *run* a tool it does not advertise
+(calling an SSP tool on the CRM server is an `unknown tool` error, even
+with SSP credentials registered). The check is a row lookup only: it
+proves a registration exists, not that the credentials still work — that
+is `credentials/verify`.
+
+A consequence worth knowing: an MCP client that caches `tools/list` at
+connect time will not see newly-registered tools until it reconnects.
 
 ### Errors: check `isError`, not the HTTP status
 
@@ -344,53 +423,61 @@ direct lookup key there, not something re-verified first.
 
 ## Provisioning a tenant end to end
 
-Against a gateway deployment (drop `/geneco-mcp` if running standalone):
+Against a gateway deployment. The two servers are independent — do one
+now and the other whenever its credentials arrive:
 
 ```bash
-HOST=http://localhost:8123/geneco-mcp
-SLUG=acme                       # you choose this
+CRM=http://localhost:8123/geneco-crm-mcp
+SSP=http://localhost:8123/geneco-ssp-mcp
+SLUG=acme                       # you choose this; same value on both
 ADMIN_KEY=dev-admin-key         # GENECO_MCP_ADMIN_API_KEY
 
 # 1. D365, via the tenant's Key Vault (prerequisites above must be done first)
-curl -s -X POST "$HOST/$SLUG/credentials" \
+curl -s -X POST "$CRM/$SLUG/credentials" \
   -H "X-Admin-Api-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"org_url":"https://acme.crm.dynamics.com","tenant_id":"<entra-guid>",
        "kv_vault_url":"https://acme-kv.vault.azure.net",
        "kv_client_id":"<vault-reader-id>","kv_client_secret":"<vault-reader-secret>"}'
 
 #    ...or, for a tenant with no Key Vault, the D365 app registration itself:
-# curl -s -X POST "$HOST/$SLUG/credentials" \
+# curl -s -X POST "$CRM/$SLUG/credentials" \
 #   -H "X-Admin-Api-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
 #   -d '{"auth_mode":"direct","org_url":"https://acme.crm.dynamics.com",
 #        "tenant_id":"<entra-guid>","client_id":"<d365-app-id>",
 #        "client_secret":"<d365-app-secret>"}'
 
-# 2. The custom cxchat API
-curl -s -X POST "$HOST/$SLUG/custom-api-credentials" \
+# 2. The SSP API — same path, the other server
+curl -s -X POST "$SSP/$SLUG/credentials" \
   -H "X-Admin-Api-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"base_url":"https://<cxchat-host>/webapi","username":"<user>","password":"<pass>"}'
 
 # 3. Prove the D365 chain works (vault -> D365, or D365 alone), no account number needed
-curl -s -X POST "$HOST/$SLUG/credentials/verify" -H "X-Admin-Api-Key: $ADMIN_KEY"
+curl -s -X POST "$CRM/$SLUG/credentials/verify" -H "X-Admin-Api-Key: $ADMIN_KEY"
 
-# 4. Confirm the tools are visible
-curl -s -X POST "$HOST/$SLUG" -H 'Content-Type: application/json' \
+# 4. Confirm the tools are visible — each server lists only its own, and
+#    only once step 1 (resp. step 2) has been done for that slug
+curl -s -X POST "$CRM/$SLUG" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+curl -s -X POST "$SSP/$SLUG" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 
 # 5. End to end, with a real account
-curl -s -X POST "$HOST/$SLUG" -H 'Content-Type: application/json' \
+curl -s -X POST "$CRM/$SLUG" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"verify_account",
        "arguments":{"account_id":"<acct>","mobile_number":"<mobile>"}}}'
 ```
 
-Steps 1–2 only prove the credentials were *stored*. Step 3 is what proves
-the D365 ones *work*, and its `detail` says what to fix if they don't —
+An empty `tools` array in step 4 means that server's stage 1 has not been
+done for this slug. Steps 1–2 only prove the credentials were *stored*.
+Step 3 is what proves the D365 ones *work*, and its `detail` says what to fix if they don't —
 do that before blaming a tool call. Step 5 is the end-to-end test: if it
 returns `isError: true` with "not available for this workspace", nothing
 is registered for that slug; if it says "I can't check that right now",
 the credentials are registered but the vault or D365 rejected them (step
-3 will say which, in that tenant's mode's vocabulary). Nothing verifies the custom API's credentials yet —
-only D365 has a `verify`.
+3 will say which, in that tenant's mode's vocabulary).
+
+The SSP server has its own `verify` at the same path — pass a real
+`account_number` in the body to make it conclusive.
 
 ## Configuration
 
@@ -400,7 +487,7 @@ All env vars are prefixed `GENECO_MCP_` — see [.env.example](./.env.example).
 |---|---|---|
 | `DATABASE_URL` | `postgresql+asyncpg://genecomcp:genecomcp-dev@localhost:55441/geneco_mcp` | Where tenant credentials are stored (D365 and custom API, one table each). |
 | `CREDENTIAL_ENCRYPTION_KEY` | *(empty)* | Fernet key encrypting each stored `kv_client_secret` (D365's vault credential) and `password` (custom API). Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. A bare env var is a stopgap — swap for a real KMS/Key Vault-issued key before production. |
-| `ADMIN_API_KEY` | *(empty)* | Sent as `X-Admin-Api-Key` — required on `/{tenant_slug}/credentials` and `/{tenant_slug}/custom-api-credentials`. |
+| `ADMIN_API_KEY` | *(empty)* | Sent as `X-Admin-Api-Key` — required on `/{tenant_slug}/credentials` on **both** servers. Shared: one key covers both. |
 | `LOG_LEVEL` | `INFO` | |
 | `LOG_FORMAT` | `json` | `json` or `human`. |
 | `ENV` | `local` | |
@@ -412,11 +499,16 @@ cp .env.example .env   # fill in DATABASE_URL / CREDENTIAL_ENCRYPTION_KEY / ADMI
 make dev                # installs [dev] extras
 docker compose -f ../docker-compose.yml up -d db   # or point DATABASE_URL at your own Postgres
 make migrate            # alembic upgrade head
-make run                # serves on :8000
+make run                # geneco-crm-mcp on :8000
+make run-ssp            # geneco-ssp-mcp on :8001 (a second terminal)
 make test
 ```
 
+Or `uvicorn gateway:app` from the repo root to get both behind their real
+`/geneco-crm-mcp` and `/geneco-ssp-mcp` prefixes.
+
 ```bash
+# Empty until this slug's credentials are registered — see stage 1.
 curl -s -X POST localhost:8000/geneco \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
@@ -444,13 +536,17 @@ stage 1 before testing the custom-API tools locally.
 ## Adding a tool
 
 1. New file under `app/tools/<name>.py`: a Pydantic input model + an
-   `@register("<name>", description=..., input_model=...)` handler that
+   `@register("<name>", kind="crm"|"ssp", description=..., input_model=...)`
+   handler that
    takes a `ToolContext` (`app/tools/registry.py`) as its first argument —
    `ctx.session` and `ctx.encryption_key` are all a handler gets; it
    builds whichever credential store it needs from those
    (`CredentialStore` for D365, `CustomApiCredentialStore` for the custom
    API, or a new store class for a new connector kind entirely).
-2. Import it in `app/tools/__init__.py`.
+2. Import it in `app/tools/__init__.py`. `kind` decides which of the two
+   servers serves it, and therefore which credentials gate it — it is
+   declared, not inferred from the tool's name (registered names carry no
+   prefix; only the module names do).
 3. If it needs a new D365 operation, add a method to `D365Connector` in
    `app/clients/d365_connector.py` (same for `CustomApiClient` and the
    custom API); wrap any new outbound `httpx`/`msal` call and response
@@ -459,10 +555,13 @@ stage 1 before testing the custom-API tools locally.
    exception (never a raw 500 to the caller).
 4. A genuinely new connector/credential kind (not D365 or the custom API)
    needs its own table in `app/store/tables.py` + Alembic migration, a
-   store class mirroring `store/custom_api_credentials.py`, and its own
-   `POST`/`GET`/`DELETE /{tenant_slug}/<kind>-credentials` routes in
-   `app/protocol/admin_router.py` reusing `_require_admin_key`.
+   store class mirroring `store/custom_api_credentials.py`, a new
+   `ToolKind` member, its own router in `app/protocol/admin_router.py`
+   (reusing `_require_admin_key`) serving `POST`/`GET`/`DELETE
+   /{tenant_slug}/credentials`, an `is_registered` method so `tools/list`
+   can gate on it, and a `SubApp` entry in `gateway.py`.
 
-`app/protocol/router.py` never needs to change — `tools/list` and
-`tools/call` both read from the registry, and handlers are handed a
+`app/protocol/router.py` never needs to change for a new tool —
+`tools/list` and `tools/call` both read the app's filtered view of the
+registry, and handlers are handed a
 store-agnostic `ToolContext` rather than a concrete store.

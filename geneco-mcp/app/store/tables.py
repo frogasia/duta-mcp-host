@@ -96,13 +96,43 @@ class D365Credential(Base):
 
 
 class CustomApiCredential(Base):
+    """A tenant's SSP (cxchat) setup, stored one of two ways — ``auth_mode``
+    says which, and exactly one mode's columns are populated on any given
+    row.
+
+    ``direct`` (the default): the Basic Auth pair is stored here
+    encrypted. ``key_vault``: only a vault-READER app lives here, and the
+    SSP user id/password (``Ssp-User-Id``/``Ssp-Password``) are fetched
+    from the tenant's vault at call time — see ``store/ssp_resolver.py``.
+
+    Mirrors ``D365Credential``'s two-mode shape, with one difference that
+    matters: ``direct`` is the default here, because every row written
+    before vault mode existed *was* a stored Basic Auth pair. ``tenant_id``
+    is its own column rather than shared with the D365 row — a tenant can
+    be onboarded to SSP without D365 at all, which is why the two MCP
+    servers were split in the first place.
+    """
+
     __tablename__ = "custom_api_credentials"
 
     tenant_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    #: ``"direct"`` or ``"key_vault"`` — see the class docstring.
+    auth_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=DIRECT_AUTH_MODE, server_default=DIRECT_AUTH_MODE
+    )
     base_url: Mapped[str] = mapped_column(String(512), nullable=False)
-    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: ``direct`` mode only — NULL on a ``key_vault`` row.
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     #: Fernet ciphertext — see ``security/crypto.py``. Never stored plaintext.
-    password_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: ``key_vault`` mode only — NULL on a ``direct`` row. The Entra tenant
+    #: GUID is the vault token's authority, so vault mode cannot work
+    #: without it.
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    kv_vault_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    kv_client_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Fernet ciphertext — see ``security/crypto.py``. Never stored plaintext.
+    kv_client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow

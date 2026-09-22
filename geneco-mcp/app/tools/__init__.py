@@ -18,6 +18,6 @@ from geneco_mcp.tools import api_reverse_fee as _api_reverse_fee  # noqa: F401
 from geneco_mcp.tools import crm_create_support_case as _crm_create_support_case  # noqa: F401
 from geneco_mcp.tools import crm_get_support_cases as _crm_get_support_cases  # noqa: F401
 from geneco_mcp.tools import crm_verify_account as _crm_verify_account  # noqa: F401
-from geneco_mcp.tools.registry import ToolSpec, all_tools, get_tool
+from geneco_mcp.tools.registry import ToolSpec, all_tools, get_tool, tools_for_kind
 
-__all__ = ["ToolSpec", "all_tools", "get_tool"]
+__all__ = ["ToolSpec", "all_tools", "get_tool", "tools_for_kind"]

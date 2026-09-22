@@ -1,9 +1,16 @@
 """Stage-1 credential intake: ``POST``/``GET``/``DELETE
-/{tenant_slug}/credentials`` (D365) and ``.../custom-api-credentials``
-(the custom fee-waiver/re-contract API), plus
-``POST /{tenant_slug}/credentials/verify``, which proves the registered
-D365 credentials actually work *from this process* rather than from
-whatever service is asking.
+/{tenant_slug}/credentials``, plus ``POST /{tenant_slug}/credentials/verify``,
+which proves the registered D365 credentials actually work *from this
+process* rather than from whatever service is asking.
+
+Two routers, one per credential kind, because each MCP sub-app mounts only
+its own (``main.py``): ``crm_router`` under ``/geneco-crm-mcp`` and
+``ssp_router`` under ``/geneco-ssp-mcp``. Both spell the resource
+``credentials`` — the mount prefix already says which backend is meant, so
+repeating it in the path (the old ``.../custom-api-credentials``) would
+name the same thing twice, in two different vocabularies. The two take
+different bodies, which is the one thing the shared path no longer hints
+at.
 
 This is a fundamentally more sensitive surface than the MCP ``tools/call``
 endpoint (``router.py``) — it accepts real secrets (D365 ``client_secret``,
@@ -27,6 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
+from geneco_mcp.clients.custom_api_client import ConnectorError as SspConnectorError
 from geneco_mcp.clients.d365_connector import ConnectorError
 from geneco_mcp.clients.keyvault_client import KeyVaultError, describe as describe_vault_error
 from geneco_mcp.config import Settings
@@ -40,12 +48,15 @@ from geneco_mcp.store.crm_resolver import CrmCredentialResolver
 from geneco_mcp.store.custom_api_credentials import (
     CustomApiCredentialsInput,
     CustomApiCredentialStore,
+    ResolvedKvCustomApiCredentials,
 )
+from geneco_mcp.store.ssp_resolver import SspCredentialResolver
 from geneco_mcp.store.tables import DIRECT_AUTH_MODE, KEY_VAULT_AUTH_MODE
 
 log = structlog.get_logger()
 
-router = APIRouter()
+crm_router = APIRouter()
+ssp_router = APIRouter()
 
 #: Upper bound on the whole check, so a hanging backend can't pin an admin
 #: request open. Comfortably under the httpx timeouts of the hops it wraps
@@ -61,6 +72,14 @@ VERIFY_TIMEOUT_SECONDS = 8.0
 _MODE_FIELDS: dict[str, tuple[str, ...]] = {
     DIRECT_AUTH_MODE: ("client_id", "client_secret"),
     KEY_VAULT_AUTH_MODE: ("kv_vault_url", "kv_client_id", "kv_client_secret"),
+}
+
+#: The same idea for SSP. ``tenant_id`` is in the vault set rather than
+#: shared: unlike D365, the SSP API itself needs no Entra tenant — the GUID
+#: is only ever the vault token's authority.
+_SSP_MODE_FIELDS: dict[str, tuple[str, ...]] = {
+    DIRECT_AUTH_MODE: ("username", "password"),
+    KEY_VAULT_AUTH_MODE: ("tenant_id", "kv_vault_url", "kv_client_id", "kv_client_secret"),
 }
 
 
@@ -174,7 +193,7 @@ def _require_admin_key(settings: Settings, x_admin_api_key: str | None) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin api key")
 
 
-@router.post("/{tenant_slug}/credentials", status_code=status.HTTP_200_OK)
+@crm_router.post("/{tenant_slug}/credentials", status_code=status.HTTP_200_OK)
 async def upsert_credentials(
     tenant_slug: str,
     body: D365CredentialsIn,
@@ -206,7 +225,7 @@ async def upsert_credentials(
     return redacted
 
 
-@router.get("/{tenant_slug}/credentials")
+@crm_router.get("/{tenant_slug}/credentials")
 async def get_credentials(
     tenant_slug: str,
     request: Request,
@@ -222,7 +241,7 @@ async def get_credentials(
     return redacted
 
 
-@router.delete("/{tenant_slug}/credentials", status_code=status.HTTP_204_NO_CONTENT)
+@crm_router.delete("/{tenant_slug}/credentials", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_credentials(
     tenant_slug: str,
     request: Request,
@@ -323,7 +342,7 @@ async def _run_verification(
     return True, _success_detail(connector.org_url, auth_mode)
 
 
-@router.post("/{tenant_slug}/credentials/verify", status_code=status.HTTP_200_OK)
+@crm_router.post("/{tenant_slug}/credentials/verify", status_code=status.HTTP_200_OK)
 async def verify_credentials(
     tenant_slug: str,
     request: Request,
@@ -379,12 +398,73 @@ async def verify_credentials(
 
 
 class CustomApiCredentialsIn(BaseModel):
-    base_url: HttpUrl = Field(description="Custom API base URL, e.g. https://api.geneco.example")
-    username: str = Field(description="Basic auth username for the custom API.")
-    password: str = Field(description="Basic auth password for the custom API.")
+    """A tenant's SSP setup in one of two shapes, chosen by ``auth_mode``
+    — mirroring the toggle duta-ilmu's tenant portal offers.
+
+    ``direct`` (the default): the credentials given are the SSP Basic Auth
+    pair, stored here encrypted. ``key_vault``: the credentials given are
+    a *vault reader's*, and the SSP pair is read from that vault at call
+    time (``Ssp-User-Id``/``Ssp-Password``), never stored here — prefer it
+    whenever a tenant can offer a vault.
+
+    ``direct`` is the default (where ``D365CredentialsIn`` defaults to
+    ``key_vault``) because every caller registering before vault mode
+    existed posted a Basic Auth pair and meant this.
+    """
+
+    auth_mode: AuthMode = Field(
+        default=DIRECT_AUTH_MODE,
+        description=(
+            "How the SSP credentials are supplied: 'direct' (default) to register the "
+            "Basic Auth pair itself, or 'key_vault' to register a vault-reader app the "
+            "pair is fetched with."
+        ),
+    )
+    base_url: HttpUrl = Field(description="SSP base URL, e.g. https://api.geneco.example")
+    username: str | None = Field(
+        default=None, description="direct mode only. Basic auth username for the SSP API."
+    )
+    password: str | None = Field(
+        default=None, description="direct mode only. Basic auth password for the SSP API."
+    )
+    tenant_id: str | None = Field(
+        default=None,
+        description="key_vault mode only. Entra (Azure AD) tenant GUID — the authority the "
+        "Key Vault token is acquired against.",
+    )
+    kv_vault_url: HttpUrl | None = Field(
+        default=None,
+        description="key_vault mode only. Key Vault URL, e.g. https://your-vault.vault.azure.net",
+    )
+    kv_client_id: str | None = Field(
+        default=None,
+        description="key_vault mode only. Client/application ID of the Entra app registration "
+        "that can read the vault.",
+    )
+    kv_client_secret: str | None = Field(
+        default=None, description="key_vault mode only. That app registration's client secret."
+    )
+
+    @model_validator(mode="after")
+    def _check_mode_fields(self) -> CustomApiCredentialsIn:
+        required = _SSP_MODE_FIELDS[self.auth_mode]
+        missing = [name for name in required if getattr(self, name) is None]
+        if missing:
+            raise ValueError(
+                f"auth_mode '{self.auth_mode}' requires {', '.join(required)} — "
+                f"missing: {', '.join(missing)}"
+            )
+        other = next(mode for mode in _SSP_MODE_FIELDS if mode != self.auth_mode)
+        unexpected = [name for name in _SSP_MODE_FIELDS[other] if getattr(self, name) is not None]
+        if unexpected:
+            raise ValueError(
+                f"auth_mode '{self.auth_mode}' does not accept {', '.join(unexpected)} — "
+                f"those belong to auth_mode '{other}'"
+            )
+        return self
 
 
-@router.post("/{tenant_slug}/custom-api-credentials", status_code=status.HTTP_200_OK)
+@ssp_router.post("/{tenant_slug}/credentials", status_code=status.HTTP_200_OK)
 async def upsert_custom_api_credentials(
     tenant_slug: str,
     body: CustomApiCredentialsIn,
@@ -398,17 +478,24 @@ async def upsert_custom_api_credentials(
         await store.upsert(
             tenant_slug,
             CustomApiCredentialsInput(
+                auth_mode=body.auth_mode,
                 base_url=str(body.base_url),
                 username=body.username,
                 password=body.password,
+                tenant_id=body.tenant_id,
+                kv_vault_url=str(body.kv_vault_url) if body.kv_vault_url else None,
+                kv_client_id=body.kv_client_id,
+                kv_client_secret=body.kv_client_secret,
             ),
         )
         redacted = await store.get_redacted(tenant_slug)
+    # Rotated vault credentials must take effect now, not at TTL expiry.
+    request.app.state.ssp_cache.invalidate(tenant_slug)
     assert redacted is not None
     return redacted
 
 
-@router.get("/{tenant_slug}/custom-api-credentials")
+@ssp_router.get("/{tenant_slug}/credentials")
 async def get_custom_api_credentials(
     tenant_slug: str,
     request: Request,
@@ -424,7 +511,7 @@ async def get_custom_api_credentials(
     return redacted
 
 
-@router.delete("/{tenant_slug}/custom-api-credentials", status_code=status.HTTP_204_NO_CONTENT)
+@ssp_router.delete("/{tenant_slug}/credentials", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_custom_api_credentials(
     tenant_slug: str,
     request: Request,
@@ -435,5 +522,193 @@ async def delete_custom_api_credentials(
     async with request.app.state.session_factory() as session:
         store = CustomApiCredentialStore(session, encryption_key=settings.credential_encryption_key)
         deleted = await store.delete(tenant_slug)
+    request.app.state.ssp_cache.invalidate(tenant_slug)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no credentials registered")
+
+
+#: Account number used when a verify call carries none of its own. The SSP
+#: API has no ping/WhoAmI endpoint, so proving the credentials means making
+#: a real lookup — and a lookup needs an account number. Deliberately
+#: well-formed but implausible: it must reach authentication, and it must
+#: not collide with a real customer's account.
+PROBE_ACCOUNT_NUMBER = "GC0000000Z"
+
+
+class SspVerifyIn(BaseModel):
+    """Optional body for the SSP verify.
+
+    Supplying a real ``account_number`` is what makes the check conclusive
+    — see ``verify_custom_api_credentials`` for why a probe alone cannot
+    be.
+    """
+
+    account_number: str | None = Field(
+        default=None,
+        description=(
+            "Optional. A real account number in this tenant's SSP backend. Given one, a "
+            "successful lookup proves the credentials end to end; without one the check "
+            "can still prove they were REJECTED, but cannot fully confirm they work."
+        ),
+    )
+
+
+#: How the SSP API spells an auth failure in its response body. It answers
+#: 400 for everything — a rejected credential included — so the status code
+#: alone cannot identify one and this marker is the actual signal.
+_SSP_AUTH_MARKER = "unauthorized"
+
+
+def _is_ssp_auth_rejection(exc: SspConnectorError) -> bool:
+    """Whether the SSP API refused these credentials.
+
+    Accepts the conventional 401/403 in case the API ever adopts them, but
+    the case that happens today is a 400 whose body says "Unauthorized
+    request" — observed for a wrong password, a wrong username, and no auth
+    header at all, each indistinguishable by status alone.
+    """
+    if exc.status_code in (401, 403):
+        return True
+    return _SSP_AUTH_MARKER in (exc.body or "").casefold()
+
+
+def _ssp_failure_detail(exc: SspConnectorError, *, probed: bool, auth_mode: str) -> tuple[bool, str]:
+    """``(ok, detail)`` for a failed SSP call.
+
+    A rejected credential is the one case this check can attribute with
+    certainty, and the wording differs by mode: in ``key_vault`` mode the
+    rejected pair is the one the vault handed back
+    (``Ssp-User-Id``/``Ssp-Password``), not anything registered here, so
+    naming the registered fields would send an admin to the wrong place.
+
+    Everything else stays inconclusive rather than being called a credential
+    failure — guessing would send an admin rotating a secret that was fine.
+    """
+    if _is_ssp_auth_rejection(exc):
+        if auth_mode == KEY_VAULT_AUTH_MODE:
+            return False, (
+                "The SSP API rejected the credentials read from Key Vault — check the "
+                "Ssp-User-Id/Ssp-Password secrets in the vault are current."
+            )
+        return False, (
+            "The SSP API rejected the registered credentials — check the registered "
+            "username and password are current."
+        )
+    if probed and exc.status_code is not None and 400 <= exc.status_code < 500:
+        return False, (
+            f"The SSP API answered {exc.status_code} for the probe account number. The "
+            "credentials were not rejected, but this cannot confirm they work — re-run this "
+            "check with a real account_number in the body."
+        )
+    if exc.status_code is not None:
+        return False, f"The SSP API returned {exc.status_code}."
+    return False, f"Could not reach the SSP API: {exc}"
+
+
+@ssp_router.post("/{tenant_slug}/credentials/verify", status_code=status.HTTP_200_OK)
+async def verify_custom_api_credentials(
+    tenant_slug: str,
+    request: Request,
+    body: SspVerifyIn | None = None,
+    x_admin_api_key: Annotated[str | None, Header()] = None,
+) -> CredentialVerifyResult:
+    """Prove the *registered* SSP credentials work, from this process.
+
+    The mirror of the CRM server's verify, and it answers the same way: a
+    failing check is a result, not an error — everything but a bad admin
+    key (401) and an unregistered tenant (404) comes back 200 with
+    ``ok=false``.
+
+    It differs in what it can promise, because the SSP API has no
+    ping/WhoAmI endpoint to lean on the way Dataverse does. The check is a
+    real read-only ``feewaiver`` lookup, so:
+
+    - With an ``account_number`` in the body, ``ok=true`` proves the whole
+      chain — vault (in ``key_vault`` mode), Basic Auth, and a live lookup.
+    - Without one, a probe account number is used. A 401/403 still proves
+      the credentials are *wrong*, which is the case worth catching before
+      a tenant goes live, but a non-auth error cannot be told apart from
+      "no such account" — so the result is ``ok=false`` with a detail
+      saying to re-run with a real account number, never a false green.
+
+    Callers that need the strong guarantee (duta-ilmu's portal, before
+    registering tools with the assistant) should always pass one.
+    """
+    settings: Settings = request.app.state.settings
+    _require_admin_key(settings, x_admin_api_key)
+    cache = request.app.state.ssp_cache
+    # A verify served from the cached vault pair proves nothing about the
+    # vault *now* — force the hop, exactly as upsert/delete do.
+    cache.invalidate(tenant_slug)
+
+    account_number = (body.account_number if body else None) or PROBE_ACCOUNT_NUMBER
+    probed = body is None or body.account_number is None
+
+    started = time.monotonic()
+    async with request.app.state.session_factory() as session:
+        store = CustomApiCredentialStore(session, encryption_key=settings.credential_encryption_key)
+        credentials = await store.get_credentials(tenant_slug)
+        if credentials is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="no credentials registered"
+            )
+        auth_mode = (
+            KEY_VAULT_AUTH_MODE
+            if isinstance(credentials, ResolvedKvCustomApiCredentials)
+            else DIRECT_AUTH_MODE
+        )
+        resolver = SspCredentialResolver(store, cache)
+        try:
+            ok, detail = await asyncio.wait_for(
+                _run_ssp_verification(resolver, tenant_slug, account_number, probed, auth_mode),
+                VERIFY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            waited_on = "Key Vault or the SSP API" if auth_mode == KEY_VAULT_AUTH_MODE else "the SSP API"
+            ok, detail = False, (
+                f"Timed out after {VERIFY_TIMEOUT_SECONDS:.0f}s waiting for {waited_on}."
+            )
+        except Exception as exc:  # last net: a verify must never 5xx
+            ok, detail = False, f"Verification failed unexpectedly ({type(exc).__name__})."
+            log.exception("ssp_credentials.verify_unexpected_error", tenant_slug=tenant_slug)
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    log.info("ssp_credentials.verified", tenant_slug=tenant_slug, ok=ok, latency_ms=latency_ms)
+    return CredentialVerifyResult(ok=ok, detail=detail, latency_ms=latency_ms)
+
+
+async def _run_ssp_verification(
+    resolver: SspCredentialResolver,
+    tenant_slug: str,
+    account_number: str,
+    probed: bool,
+    auth_mode: str,
+) -> tuple[bool, str]:
+    """The check itself: a read-only ``feewaiver`` lookup, preceded by the
+    vault hop in ``key_vault`` mode. Never raises for a credential or
+    network problem — every failure is an answer."""
+    try:
+        client = await resolver.get_client(tenant_slug)
+    except SspConnectorError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, KeyVaultError):
+            return False, describe_vault_error(cause)
+        return False, f"Could not read this tenant's SSP credentials: {exc}"
+    if client is None:
+        # Raced with a DELETE between the registration check and here.
+        return False, "No credentials are registered for this tenant."
+    try:
+        await client.verify_access(account_number)
+    except SspConnectorError as exc:
+        return _ssp_failure_detail(exc, probed=probed, auth_mode=auth_mode)
+    if probed:
+        return True, (
+            "The SSP API accepted the credentials and answered the probe lookup"
+            + (" (via Key Vault)" if auth_mode == KEY_VAULT_AUTH_MODE else "")
+            + "."
+        )
+    return True, (
+        "The SSP API answered a live lookup for the account number given"
+        + (" — Key Vault returned the credentials and they were accepted" if auth_mode == KEY_VAULT_AUTH_MODE else "")
+        + "."
+    )

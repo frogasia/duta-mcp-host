@@ -29,6 +29,7 @@ class VerifyAccountInput(BaseModel):
 
 @register(
     "verify_account",
+    kind="crm",
     description=(
         "Verify a customer's account by account number and mobile number, "
         "returning the account holder's name and balance if they match."

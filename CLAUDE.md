@@ -8,17 +8,21 @@ chat application — the layering names differ, the principles don't.
 
 ```
 duta-mcp-host/
-├── gateway.py              # Mounts geneco-mcp (and future MCP hosts) behind one uvicorn
+├── gateway.py              # Mounts geneco-mcp twice (crm + ssp) behind one uvicorn
 ├── shared/                 # duta_mcp_shared — structlog + per-request context
-└── geneco-mcp/                # MCP server for account inquiry / create case / case inquiry
-    │                          + Geneco's custom cxchat API tools (fee waiver, re-contract
-    │                          eligibility, fee reversal, password reset)
+└── geneco-mcp/                # TWO MCP servers over one codebase, split by backend:
+    │                          geneco-crm-mcp (account inquiry / create case / case
+    │                          inquiry) and geneco-ssp-mcp (Geneco's self-service-portal
+    │                          cxchat API: fee waiver, re-contract eligibility, fee
+    │                          reversal, password reset). create_app(kind=...) picks one.
     ├── alembic/              # Migrations for the credential store
     └── app/
         ├── protocol/        # ← MCP wire boundary: tools/call (router.py) + credential
-        │                      intake (admin_router.py). tenant_slug from the URL.
+        │                      intake (admin_router.py's crm_router/ssp_router, one per
+        │                      credential kind). tenant_slug from the URL.
         ├── tools/           # Tool definitions + handlers (LLM-facing contract, one file
-        │                      each — crm_* prefix for D365 tools, api_* for custom API tools)
+        │                      each — crm_* / api_* module prefixes; the registered tool
+        │                      NAMES are bare, so the split is by @register(kind=...))
         ├── clients/         # D365Connector (MSAL OAuth2) + CustomApiClient (Basic Auth)
         │                      + KeyVaultClient (reads each tenant's D365 creds at call time)
         ├── store/           # Postgres-backed tenant credential store, one table per connector
@@ -30,6 +34,28 @@ duta-mcp-host/
 `geneco-mcp` owns its own D365 connector, custom API client, and encrypted
 credential storage for both — it talks to D365 and the custom cxchat API
 directly and has no dependency on duta-ilmu's integration-hub.
+
+**The two servers.** `/geneco-crm-mcp` and `/geneco-ssp-mcp` are separate
+MCP endpoints because a tenant's credentials for the two backends arrive
+at different times and the portal registers each connector when its own
+credentials exist. Same codebase, same DB, same deployment — `kind`
+(`app/main.py`) picks the tool set and the credential-intake router. Two
+invariants hold the split together, and both have tests: a server never
+*runs* a tool it does not advertise (`tools/call` resolves against
+`app.state.tools_by_name`, never the global registry), and both servers
+serve `/{tenant_slug}/credentials` — the mount prefix is what says which
+backend, so don't reintroduce a kind-qualified path like the old
+`custom-api-credentials`.
+
+**`tools/list` is credential-gated.** A server advertises its tools only
+once `is_registered()` says that tenant has the credentials behind them,
+and returns `{"tools": []}` otherwise — a tenant mid-onboarding must not
+be offered tools whose every call answers "not available for this
+workspace right now". Keep that a row-existence check: no vault hop, no
+outbound call, nothing decrypted. `get_credentials()` and
+`is_registered()` answer through the same predicate on purpose, so
+"registered" can never mean one thing to the list and another to the
+call.
 
 ## Coding principles
 

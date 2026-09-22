@@ -96,6 +96,24 @@ class ResolvedDirectCredentials:
     field_map: dict[str, str]
 
 
+def _has_usable_pair(row: D365Credential) -> bool:
+    """Whether the row actually carries the credential pair its
+    ``auth_mode`` calls for.
+
+    A row missing its pair can only come from a hand-edited DB. Both
+    ``get_credentials`` and ``is_registered`` answer through this, so
+    "registered" can never mean something different to the tool list than
+    it does to the tool call.
+    """
+    if row.auth_mode == DIRECT_AUTH_MODE:
+        return row.client_id is not None and row.client_secret_encrypted is not None
+    return (
+        row.kv_vault_url is not None
+        and row.kv_client_id is not None
+        and row.kv_client_secret_encrypted is not None
+    )
+
+
 class CredentialStore:
     def __init__(self, session: AsyncSession, *, encryption_key: str) -> None:
         self._session = session
@@ -173,6 +191,23 @@ class CredentialStore:
         redacted["enabled"] = row.enabled
         return redacted
 
+    async def is_registered(self, tenant_slug: str) -> bool:
+        """Whether a tool call for this tenant would find credentials —
+        without decrypting anything.
+
+        Used by ``tools/list`` to decide whether to advertise the D365
+        tools at all, which is a question about the row's presence, not
+        about whether the credentials still *work* (that is
+        ``POST /{tenant_slug}/credentials/verify``, and it costs a vault
+        hop plus a Dataverse round trip — far too much for a list call).
+        """
+        row = await self._session.scalar(
+            select(D365Credential).where(
+                D365Credential.tenant_slug == tenant_slug, D365Credential.enabled.is_(True)
+            )
+        )
+        return row is not None and _has_usable_pair(row)
+
     async def get_credentials(
         self, tenant_slug: str
     ) -> ResolvedKvCredentials | ResolvedDirectCredentials | None:
@@ -186,14 +221,13 @@ class CredentialStore:
                 D365Credential.tenant_slug == tenant_slug, D365Credential.enabled.is_(True)
             )
         )
-        if row is None:
+        if row is None or not _has_usable_pair(row):
+            # Treat a row missing its pair as unregistered rather than
+            # building a connector that would fail confusingly at token
+            # acquisition.
             return None
         if row.auth_mode == DIRECT_AUTH_MODE:
-            # A direct row without its pair can only come from a hand-edited
-            # DB — treat it as unregistered rather than building a connector
-            # that would fail confusingly at token acquisition.
-            if row.client_id is None or row.client_secret_encrypted is None:
-                return None
+            assert row.client_id is not None and row.client_secret_encrypted is not None
             return ResolvedDirectCredentials(
                 org_url=row.org_url,
                 tenant_id=row.tenant_id,
@@ -203,12 +237,8 @@ class CredentialStore:
                 ),
                 field_map=row.field_map,
             )
-        if (
-            row.kv_vault_url is None
-            or row.kv_client_id is None
-            or row.kv_client_secret_encrypted is None
-        ):
-            return None
+        assert row.kv_vault_url is not None and row.kv_client_secret_encrypted is not None
+        assert row.kv_client_id is not None
         return ResolvedKvCredentials(
             org_url=row.org_url,
             tenant_id=row.tenant_id,

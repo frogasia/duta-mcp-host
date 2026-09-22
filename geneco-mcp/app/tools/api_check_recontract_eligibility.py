@@ -14,8 +14,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from geneco_mcp.clients.custom_api_client import ConnectorError, CustomApiClient
+from geneco_mcp.clients.custom_api_client import ConnectorError
 from geneco_mcp.store.custom_api_credentials import CustomApiCredentialStore
+from geneco_mcp.store.ssp_resolver import SspCredentialResolver
 from geneco_mcp.tools._common import RECONTRACT_ELIGIBILITY_NOT_CONFIGURED_ERROR, UNAVAILABLE_ERROR
 from geneco_mcp.tools.registry import ToolContext, register
 
@@ -26,6 +27,7 @@ class CheckRecontractEligibilityInput(BaseModel):
 
 @register(
     "check_recontract_eligibility",
+    kind="ssp",
     description="Check whether a customer's account is eligible to re-contract, by account number.",
     input_model=CheckRecontractEligibilityInput,
 )
@@ -33,12 +35,14 @@ async def handle(
     ctx: ToolContext, tenant_slug: str, args: CheckRecontractEligibilityInput
 ) -> dict[str, Any]:
     store = CustomApiCredentialStore(ctx.session, encryption_key=ctx.encryption_key)
-    credentials = await store.get_credentials(tenant_slug)
-    if credentials is None:
+    resolver = SspCredentialResolver(store, ctx.ssp_cache)
+    try:
+        client = await resolver.get_client(tenant_slug)
+    except ConnectorError:
+        # The tenant is configured but its vault couldn't be read.
+        return {"error": UNAVAILABLE_ERROR}
+    if client is None:
         return {"error": RECONTRACT_ELIGIBILITY_NOT_CONFIGURED_ERROR}
-    client = CustomApiClient(
-        base_url=credentials.base_url, username=credentials.username, password=credentials.password
-    )
     try:
         result = await client.check_recontract_eligibility(args.account_number)
     except ConnectorError:

@@ -8,6 +8,12 @@ Adding a new sub-app:
     1. Import its ``create_app`` factory.
     2. Append a ``SubApp(...)`` entry to ``SUB_APPS``.
 Nothing else in this module should need to change.
+
+geneco-mcp mounts twice, once per backend it fronts, so a tenant onboarded
+to D365 weeks before the self-service portal (or the other way round) has
+one connector to register now and the other later. Same codebase and same
+database both times — only the tool set and the credential-intake body
+differ, picked by ``kind`` (see ``geneco_mcp/main.py``).
 """
 
 from __future__ import annotations
@@ -40,7 +46,16 @@ class SubApp:
 
 
 SUB_APPS: tuple[SubApp, ...] = (
-    SubApp(name="geneco-mcp", path_prefix="/geneco-mcp", app=create_geneco_mcp()),
+    SubApp(
+        name="geneco-crm-mcp",
+        path_prefix="/geneco-crm-mcp",
+        app=create_geneco_mcp(kind="crm"),
+    ),
+    SubApp(
+        name="geneco-ssp-mcp",
+        path_prefix="/geneco-ssp-mcp",
+        app=create_geneco_mcp(kind="ssp"),
+    ),
 )
 
 

@@ -27,9 +27,29 @@ FORGOT_PASSWORD_PATH = "/api/forgotpasswordv2"
 
 
 class ConnectorError(Exception):
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    """``status_code`` is the SSP API's own HTTP status when there was one,
+    and ``None`` for a network-level failure or an unparseable body.
+    ``body`` is its response text, truncated.
+
+    Both are carried structurally because ``credentials/verify`` has to tell
+    "these credentials were rejected" from "the backend is having a bad day",
+    and only the former is the admin's to fix. The status alone cannot say:
+    this API answers EVERY auth failure with 400 and puts the reason in the
+    body (``{"responsecode":"GEN400","errordescription":"Unauthorized
+    request"}``), so the body is the only place that signal exists."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        status_code: int | None = None,
+        body: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
+        self.body = body
 
 
 class CustomApiClient:
@@ -57,7 +77,11 @@ class CustomApiClient:
         except httpx.HTTPError as exc:
             raise ConnectorError(f"custom API request failed: {exc}") from exc
         if resp.status_code >= 400:
-            raise ConnectorError(f"custom API request failed {resp.status_code}: {resp.text[:500]}")
+            raise ConnectorError(
+                f"custom API request failed {resp.status_code}: {resp.text[:500]}",
+                status_code=resp.status_code,
+                body=resp.text[:500],
+            )
         return resp
 
     @staticmethod
@@ -66,6 +90,24 @@ class CustomApiClient:
             return resp.json()
         except ValueError as exc:
             raise ConnectorError("malformed custom API response (not JSON)") from exc
+
+    async def verify_access(self, account_number: str) -> None:
+        """Prove these credentials are accepted by the SSP API. Returns on
+        success, raises ``ConnectorError`` otherwise.
+
+        Probes ``feewaiver`` because it is the only *read-only* endpoint of
+        the four with a plain status-code contract. Deliberately NOT
+        ``feereversal`` (it mutates a customer's account) and NOT
+        ``forgotpasswordv2`` (it emails a real customer, and answers a
+        business decline with HTTP 502 — unreadable as an auth signal).
+
+        What a 2xx proves is that Basic Auth was accepted and the endpoint
+        ran; the caller decides what a non-auth failure means, since that
+        depends on whether it passed a real account number or a probe.
+        """
+        await self._request(
+            "POST", FEE_WAIVER_PATH, json_body={"AccountNumber": account_number}
+        )
 
     async def get_fee_waiver_status(self, account_number: str) -> dict[str, Any]:
         """Fee waiver contract lines (ETF, APDF, LPC, PF) for an account.
