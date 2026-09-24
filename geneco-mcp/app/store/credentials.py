@@ -56,6 +56,11 @@ class D365CredentialsInput:
     kv_vault_url: str | None = None
     kv_client_id: str | None = None
     kv_client_secret: str | None = None
+    #: ``key_vault`` mode — what this tenant's vault calls the two
+    #: secrets holding the D365 app registration. Required there (enforced
+    #: at the intake boundary); optional here only for ``direct`` rows.
+    kv_secret_name_client_id: str | None = None
+    kv_secret_name_client_secret: str | None = None
     #: ``direct`` mode — the D365 app registration itself.
     client_id: str | None = None
     client_secret: str | None = None
@@ -68,6 +73,10 @@ class ResolvedKvCredentials:
 
     ``client_id``/``client_secret`` here are the *vault reader's* — the
     D365 pair is what reading the vault produces.
+
+    The two ``*_secret_name`` fields are never ``None`` — a row that does
+    not carry them is not usable in this mode at all (see
+    ``_has_usable_pair``), so the resolver always has a name to ask for.
     """
 
     org_url: str
@@ -75,6 +84,8 @@ class ResolvedKvCredentials:
     vault_url: str
     client_id: str
     client_secret: str
+    client_id_secret_name: str
+    client_secret_secret_name: str
     field_map: dict[str, str]
 
 
@@ -111,6 +122,10 @@ def _has_usable_pair(row: D365Credential) -> bool:
         row.kv_vault_url is not None
         and row.kv_client_id is not None
         and row.kv_client_secret_encrypted is not None
+        # No names, nothing to ask the vault for — as unusable as a
+        # row missing the pair itself.
+        and row.kv_secret_name_client_id is not None
+        and row.kv_secret_name_client_secret is not None
     )
 
 
@@ -140,6 +155,8 @@ class CredentialStore:
             row.kv_vault_url = None
             row.kv_client_id = None
             row.kv_client_secret_encrypted = None
+            row.kv_secret_name_client_id = None
+            row.kv_secret_name_client_secret = None
         else:
             assert (
                 config.kv_vault_url is not None
@@ -151,6 +168,8 @@ class CredentialStore:
             row.kv_client_secret_encrypted = encrypt_secret(
                 config.kv_client_secret, key=self._encryption_key
             )
+            row.kv_secret_name_client_id = config.kv_secret_name_client_id
+            row.kv_secret_name_client_secret = config.kv_secret_name_client_secret
             row.client_id = None
             row.client_secret_encrypted = None
         row.field_map = config.field_map
@@ -187,6 +206,8 @@ class CredentialStore:
             redacted["kv_vault_url"] = row.kv_vault_url
             redacted["kv_client_id"] = row.kv_client_id
             redacted["kv_client_secret"] = MASK
+            redacted["kv_secret_name_client_id"] = row.kv_secret_name_client_id
+            redacted["kv_secret_name_client_secret"] = row.kv_secret_name_client_secret
         redacted["field_map"] = row.field_map
         redacted["enabled"] = row.enabled
         return redacted
@@ -239,11 +260,15 @@ class CredentialStore:
             )
         assert row.kv_vault_url is not None and row.kv_client_secret_encrypted is not None
         assert row.kv_client_id is not None
+        assert row.kv_secret_name_client_id is not None
+        assert row.kv_secret_name_client_secret is not None
         return ResolvedKvCredentials(
             org_url=row.org_url,
             tenant_id=row.tenant_id,
             vault_url=row.kv_vault_url,
             client_id=row.kv_client_id,
             client_secret=decrypt_secret(row.kv_client_secret_encrypted, key=self._encryption_key),
+            client_id_secret_name=row.kv_secret_name_client_id,
+            client_secret_secret_name=row.kv_secret_name_client_secret,
             field_map=row.field_map,
         )

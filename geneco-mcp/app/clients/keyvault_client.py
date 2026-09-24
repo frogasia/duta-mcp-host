@@ -3,7 +3,7 @@ against the tenant's Key-Vault-scoped Entra app registration.
 
 This is the first hop of the two-hop credential chain: a tenant's stored
 Key Vault credentials fetch that tenant's *real* D365 app registration
-(``Crm-Client-Id``/``Crm-Client-Secret``) at call time, so the D365 secret
+(under names that tenant's row carries) at call time, so the D365 secret
 itself is never at rest in this service — only the vault credential is
 (see ``store/crm_resolver.py`` for the caching layer above this).
 
@@ -27,17 +27,14 @@ API_VERSION = "7.4"
 #: OAuth2 scope for the Key Vault data plane.
 VAULT_SCOPE = "https://vault.azure.net/.default"
 
-#: Vault secret names holding the tenant's real D365 app registration.
-#: Hardcoded deliberately — every tenant's vault uses these exact names
-#: (matching geneco-poc's ``crm_client.py``); make them per-tenant columns
-#: only if a tenant ever needs different ones.
-GENECO_CRM_CLIENT_ID_SECRET = "Crm-Client-Id"
-GENECO_CRM_CLIENT_SECRET_SECRET = "Crm-Client-Secret"
-
-#: Vault secret names holding the tenant's SSP (cxchat) Basic Auth pair.
-#: Fixed for the same reason as the CRM pair above.
-GENECO_SSP_USER_ID_SECRET = "Ssp-User-Id"
-GENECO_SSP_PASSWORD_SECRET = "Ssp-Password"
+#: No secret names live here: they are per-tenant, carried on the
+#: credential row as ``kv_secret_name_*``.
+#:
+#: What Azure accepts as a secret name: letters, digits and dashes only,
+#: up to 127 characters. Underscores are rejected by the vault itself with
+#: a 400 ``BadParameter``, so validating names at credential intake turns
+#: a confusing runtime failure into a readable 422.
+SECRET_NAME_PATTERN = r"^[A-Za-z0-9-]{1,127}$"
 
 
 class KeyVaultError(Exception):
@@ -81,8 +78,16 @@ def describe(exc: KeyVaultError) -> str:
         )
     if exc.status_code == 404:
         return (
-            f"Key Vault has no {where} — create it in that vault (the names are fixed: "
-            f"{GENECO_CRM_CLIENT_ID_SECRET} / {GENECO_CRM_CLIENT_SECRET_SECRET})."
+            f"Key Vault has no {where} — create it in that vault, or register the name this "
+            "tenant's vault actually uses when posting its credentials."
+        )
+    if exc.status_code == 400:
+        # Reachable only via a registered name the vault won't accept:
+        # intake validates against SECRET_NAME_PATTERN, but a row written
+        # before that validation existed can still carry one.
+        return (
+            f"Key Vault rejected the name of {where} as invalid — a secret name may contain "
+            "only letters, digits and dashes (no underscores)."
         )
     if exc.status_code is not None:
         # The message for an HTTP failure embeds the vault's own response
@@ -169,14 +174,22 @@ class KeyVaultClient:
             )
         return value
 
-    async def get_crm_credentials(self) -> tuple[str, str]:
-        """The tenant's real D365 app registration, as ``(client_id, client_secret)``."""
-        client_id = await self.get_secret(GENECO_CRM_CLIENT_ID_SECRET)
-        client_secret = await self.get_secret(GENECO_CRM_CLIENT_SECRET_SECRET)
+    async def get_crm_credentials(
+        self, *, client_id_secret: str, client_secret_secret: str
+    ) -> tuple[str, str]:
+        """The tenant's real D365 app registration, as ``(client_id, client_secret)``.
+
+        Both names are required, with no fallback: the caller has read the
+        tenant's row and knows what that vault calls them.
+        """
+        client_id = await self.get_secret(client_id_secret)
+        client_secret = await self.get_secret(client_secret_secret)
         return client_id, client_secret
 
-    async def get_ssp_credentials(self) -> tuple[str, str]:
+    async def get_ssp_credentials(
+        self, *, username_secret: str, password_secret: str
+    ) -> tuple[str, str]:
         """The tenant's SSP Basic Auth pair, as ``(username, password)``."""
-        username = await self.get_secret(GENECO_SSP_USER_ID_SECRET)
-        password = await self.get_secret(GENECO_SSP_PASSWORD_SECRET)
+        username = await self.get_secret(username_secret)
+        password = await self.get_secret(password_secret)
         return username, password

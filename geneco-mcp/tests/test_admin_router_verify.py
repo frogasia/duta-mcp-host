@@ -73,6 +73,8 @@ def _seed_credentials(crm_client: TestClient, tenant_slug: str = "geneco") -> No
             "kv_vault_url": KV_URL,
             "kv_client_id": "kv1",
             "kv_client_secret": VAULT_SECRET,
+            "kv_secret_name_client_id": "Crm-Client-Id",
+            "kv_secret_name_client_secret": "Crm-Client-Secret",
         },
     )
     assert resp.status_code == 200

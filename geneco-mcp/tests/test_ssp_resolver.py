@@ -31,6 +31,8 @@ KV_CREDENTIALS = CustomApiCredentialsInput(
     kv_vault_url=VAULT_URL,
     kv_client_id="kv1",
     kv_client_secret="kv-secret",
+    kv_secret_name_username="Ssp-User-Id",
+    kv_secret_name_password="Ssp-Password",
 )
 
 

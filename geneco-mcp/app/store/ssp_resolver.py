@@ -4,9 +4,9 @@ are stored (``store/custom_api_credentials.py``).
 
 The mirror of ``store/crm_resolver.py`` for the other backend, and for the
 same reason: ``key_vault`` mode fetches the tenant's real SSP Basic Auth
-pair (``Ssp-User-Id``/``Ssp-Password``) from its Key Vault and caches it
-in memory, so the vault is hit once per TTL rather than once per tool
-call, and the SSP password exists only in this process's memory. The fetch
+pair from its Key Vault, under the secret names that tenant registered,
+and caches it in memory, so the vault is hit once per TTL rather than once
+per tool call, and the SSP password exists only in this process's memory. The fetch
 is lazy, so a tenant registered after boot works without a restart and a
 vault outage degrades only the tenant being called.
 
@@ -114,7 +114,10 @@ class SspCredentialResolver:
                 client_secret=kv.client_secret,
             )
             try:
-                ssp_username, ssp_password = await client.get_ssp_credentials()
+                ssp_username, ssp_password = await client.get_ssp_credentials(
+                    username_secret=kv.username_secret_name,
+                    password_secret=kv.password_secret_name,
+                )
             except KeyVaultError as exc:
                 # Translate at the boundary so tools keep catching one
                 # error type — an unwrapped KeyVaultError here would reach

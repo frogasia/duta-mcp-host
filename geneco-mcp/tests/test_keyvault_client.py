@@ -36,7 +36,7 @@ async def test_get_secret_returns_value(vault_client: KeyVaultClient) -> None:
 
 
 @respx.mock
-async def test_get_crm_credentials_reads_both_hardcoded_names(
+async def test_get_crm_credentials_reads_the_names_it_is_given(
     vault_client: KeyVaultClient,
 ) -> None:
     respx.get(f"{VAULT_URL}/secrets/Crm-Client-Id").mock(
@@ -46,7 +46,19 @@ async def test_get_crm_credentials_reads_both_hardcoded_names(
         return_value=Response(200, json={"value": "crm-secret"})
     )
     with _stub_token(vault_client):
-        assert await vault_client.get_crm_credentials() == ("crm-id", "crm-secret")
+        assert await vault_client.get_crm_credentials(
+            client_id_secret="Crm-Client-Id", client_secret_secret="Crm-Client-Secret"
+        ) == ("crm-id", "crm-secret")
+
+
+async def test_secret_names_have_no_defaults(vault_client: KeyVaultClient) -> None:
+    """This module must not know any tenant's naming. If a default ever
+    creeps back onto these signatures, a caller that forgot to pass the
+    tenant's own names would silently read someone else's."""
+    with pytest.raises(TypeError):
+        await vault_client.get_crm_credentials()
+    with pytest.raises(TypeError):
+        await vault_client.get_ssp_credentials()
 
 
 @respx.mock

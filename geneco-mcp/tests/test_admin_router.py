@@ -14,6 +14,8 @@ CREDENTIALS_BODY = {
     "kv_vault_url": "https://geneco-kv.vault.azure.net",
     "kv_client_id": "77fa3ab9-8247-48e4-8ad5-5fc959ef7f24",
     "kv_client_secret": "super-secret-value",
+    "kv_secret_name_client_id": "Crm-Client-Id",
+    "kv_secret_name_client_secret": "Crm-Client-Secret",
 }
 
 DIRECT_BODY = {
@@ -181,6 +183,8 @@ def test_a_body_carrying_the_other_modes_fields_is_rejected(crm_client: TestClie
             "kv_vault_url": CREDENTIALS_BODY["kv_vault_url"],
             "kv_client_id": CREDENTIALS_BODY["kv_client_id"],
             "kv_client_secret": CREDENTIALS_BODY["kv_client_secret"],
+            "kv_secret_name_client_id": "Crm-Client-Id",
+            "kv_secret_name_client_secret": "Crm-Client-Secret",
         }}
     )
     assert resp.status_code == 422

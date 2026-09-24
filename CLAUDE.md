@@ -140,11 +140,28 @@ proxying to a system that had this same gap).
 - **In `key_vault` mode the D365 secret is never at rest here** — and that
   mode is the default and the one to prefer. `d365_credentials` stores the
   tenant's *Key Vault* app registration; the real D365 one
-  (`Crm-Client-Id`/`Crm-Client-Secret`, names hardcoded in
-  `clients/keyvault_client.py`) is fetched on first use and lives only in
-  the in-memory TTL cache in `store/crm_resolver.py`. Don't add a code path
-  that writes a fetched `Crm-Client-Secret` to the DB or a log — that would
-  undo the whole point of the indirection.
+  (`Crm-Client-Id`/`Crm-Client-Secret` by default) is fetched on first use
+  and lives only in the in-memory TTL cache in `store/crm_resolver.py`.
+  Don't add a code path that writes a fetched `Crm-Client-Secret` to the DB
+  or a log — that would undo the whole point of the indirection.
+- **The vault secret names are per-tenant and mandatory — this service
+  hardcodes none of them.** Every tenant registers its own at intake
+  (`kv_secret_name_*`, required in `key_vault` mode, stored plain: a name
+  is not a secret, and read paths echo it so an admin can see what will be
+  looked up). **Don't reintroduce a default.** A default is
+  indistinguishable from a deliberate choice at the moment it fails, and
+  it fails on a customer-facing tool call rather than at registration —
+  which is exactly why `get_crm_credentials`/`get_ssp_credentials` take
+  the names as required keyword args, and why `_has_usable_pair` treats a
+  vault row without them as *unregistered* rather than guessing. Migration
+  0006 back-filled the rows that predate the columns; there is no
+  coalescing anywhere. Names are validated against `SECRET_NAME_PATTERN`
+  at intake because Azure rejects anything but letters, digits and dashes
+  with a 400 the tenant would otherwise only hit at call time.
+- A user-facing message that names a vault secret (the verify endpoint's
+  `detail`) must name *that tenant's* secret, threaded through from its
+  row — never a literal. Two tenants' vaults need not spell them alike,
+  and a wrong name sends an admin to fix something that isn't there.
 - `auth_mode: "direct"` is the deliberate exception, for tenants with no
   vault to read from: `client_id`/`client_secret_encrypted` then hold the
   D365 app registration itself. A row is in exactly one mode and `upsert`

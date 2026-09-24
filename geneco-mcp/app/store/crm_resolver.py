@@ -5,7 +5,7 @@ stored (``store/credentials.py``).
 ``key_vault`` mode fetches the tenant's real D365 app registration from
 its Key Vault and caches the result in memory so the vault is hit once per
 TTL rather than once per tool call. This is the layer that keeps
-``Crm-Client-Secret`` out of the database: the DB holds only the tenant's
+the D365 secret out of the database: the DB holds only the tenant's
 *vault* credentials, and the D365 secret exists solely in this process's
 memory, for at most ``CRM_CREDENTIAL_CACHE_TTL_SECONDS``. The fetch is
 lazy — on a tenant's first call, not at startup — so a tenant registered
@@ -124,7 +124,10 @@ class CrmCredentialResolver:
                 client_secret=kv.client_secret,
             )
             try:
-                crm_client_id, crm_client_secret = await client.get_crm_credentials()
+                crm_client_id, crm_client_secret = await client.get_crm_credentials(
+                    client_id_secret=kv.client_id_secret_name,
+                    client_secret_secret=kv.client_secret_secret_name,
+                )
             except KeyVaultError as exc:
                 # Translate at the boundary so tools keep catching one
                 # error type — an unwrapped KeyVaultError here would reach

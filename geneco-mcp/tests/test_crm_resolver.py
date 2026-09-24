@@ -22,6 +22,8 @@ CREDENTIALS = D365CredentialsInput(
     kv_vault_url=VAULT_URL,
     kv_client_id="kv1",
     kv_client_secret="kv-secret",
+    kv_secret_name_client_id="Crm-Client-Id",
+    kv_secret_name_client_secret="Crm-Client-Secret",
 )
 
 DIRECT_CREDENTIALS = D365CredentialsInput(

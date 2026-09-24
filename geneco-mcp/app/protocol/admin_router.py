@@ -36,7 +36,11 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 from geneco_mcp.clients.custom_api_client import ConnectorError as SspConnectorError
 from geneco_mcp.clients.d365_connector import ConnectorError
-from geneco_mcp.clients.keyvault_client import KeyVaultError, describe as describe_vault_error
+from geneco_mcp.clients.keyvault_client import (
+    SECRET_NAME_PATTERN,
+    KeyVaultError,
+    describe as describe_vault_error,
+)
 from geneco_mcp.config import Settings
 from geneco_mcp.store.credentials import (
     AuthMode,
@@ -71,7 +75,15 @@ VERIFY_TIMEOUT_SECONDS = 8.0
 #: wrong kind of app registration.
 _MODE_FIELDS: dict[str, tuple[str, ...]] = {
     DIRECT_AUTH_MODE: ("client_id", "client_secret"),
-    KEY_VAULT_AUTH_MODE: ("kv_vault_url", "kv_client_id", "kv_client_secret"),
+    KEY_VAULT_AUTH_MODE: (
+        "kv_vault_url",
+        "kv_client_id",
+        "kv_client_secret",
+        # Mandatory: a default would turn a registration mistake into
+        # a failure on a live tool call.
+        "kv_secret_name_client_id",
+        "kv_secret_name_client_secret",
+    ),
 }
 
 #: The same idea for SSP. ``tenant_id`` is in the vault set rather than
@@ -79,7 +91,14 @@ _MODE_FIELDS: dict[str, tuple[str, ...]] = {
 #: is only ever the vault token's authority.
 _SSP_MODE_FIELDS: dict[str, tuple[str, ...]] = {
     DIRECT_AUTH_MODE: ("username", "password"),
-    KEY_VAULT_AUTH_MODE: ("tenant_id", "kv_vault_url", "kv_client_id", "kv_client_secret"),
+    KEY_VAULT_AUTH_MODE: (
+        "tenant_id",
+        "kv_vault_url",
+        "kv_client_id",
+        "kv_client_secret",
+        "kv_secret_name_username",
+        "kv_secret_name_password",
+    ),
 }
 
 
@@ -89,7 +108,8 @@ class D365CredentialsIn(BaseModel):
 
     ``key_vault`` (the default): the credentials given are the *vault
     reader's*, and the D365 app registration is read from that vault at
-    call time (``Crm-Client-Id``/``Crm-Client-Secret``), never stored here.
+    call time, under the secret names registered alongside it, never stored
+    here.
 
     ``direct``: the credentials given *are* the D365 app registration, for
     a tenant with no vault. That secret is then stored here (encrypted),
@@ -126,6 +146,23 @@ class D365CredentialsIn(BaseModel):
     )
     kv_client_secret: str | None = Field(
         default=None, description="key_vault mode only. That app registration's client secret."
+    )
+    kv_secret_name_client_id: str | None = Field(
+        default=None,
+        pattern=SECRET_NAME_PATTERN,
+        description=(
+            "key_vault mode: REQUIRED. What this tenant's vault calls the secret holding the "
+            "D365 client ID. Note this names a secret; it is not the client ID itself, nor "
+            "kv_client_id (which is the vault reader's own app registration)."
+        ),
+    )
+    kv_secret_name_client_secret: str | None = Field(
+        default=None,
+        pattern=SECRET_NAME_PATTERN,
+        description=(
+            "key_vault mode: REQUIRED. What this tenant's vault calls the secret holding the "
+            "D365 client secret."
+        ),
     )
     client_id: str | None = Field(
         default=None,
@@ -213,6 +250,8 @@ async def upsert_credentials(
                 kv_vault_url=str(body.kv_vault_url) if body.kv_vault_url else None,
                 kv_client_id=body.kv_client_id,
                 kv_client_secret=body.kv_client_secret,
+                kv_secret_name_client_id=body.kv_secret_name_client_id,
+                kv_secret_name_client_secret=body.kv_secret_name_client_secret,
                 client_id=body.client_id,
                 client_secret=body.client_secret,
                 field_map=body.field_map,
@@ -272,14 +311,21 @@ class CredentialVerifyResult(BaseModel):
     latency_ms: int = Field(description="Wall-clock time the whole check took.")
 
 
-def _d365_failure_detail(exc: ConnectorError, org_url: str, auth_mode: str) -> str:
+def _d365_failure_detail(
+    exc: ConnectorError,
+    org_url: str,
+    auth_mode: str,
+    client_id_secret_name: str | None = None,
+) -> str:
     """A D365-side failure in the vocabulary a tenant admin can act on.
 
     The 401/403 wording differs by mode: in ``key_vault`` mode the app
-    registration D365 rejected is the one named by the vault's
-    ``Crm-Client-Id`` secret, while in ``direct`` mode it is the
-    ``client_id`` registered here — naming the vault secret to a direct
-    tenant would send them looking for something that isn't in play.
+    registration D365 rejected is the one named by that tenant's client-ID
+    secret, while in ``direct`` mode it is the ``client_id`` registered
+    here — naming the vault secret to a direct tenant would send them
+    looking for something that isn't in play. The secret is named from the
+    tenant's own row rather than assumed, since two tenants' vaults need
+    not spell it alike.
     """
     if exc.status_code in (401, 403):
         if auth_mode == DIRECT_AUTH_MODE:
@@ -288,9 +334,10 @@ def _d365_failure_detail(exc: ConnectorError, org_url: str, auth_mode: str) -> s
                 "registered client_id app registration is provisioned as an Application User "
                 "in this org, and that its client_secret is current."
             )
+        named = client_id_secret_name or "the vault's client-ID"
         return (
             f"D365 rejected the credentials read from Key Vault ({exc.status_code}) — check the "
-            "Crm-Client-Id app registration is provisioned as an Application User in this org."
+            f"{named} app registration is provisioned as an Application User in this org."
         )
     if exc.status_code is not None:
         return f"D365 returned {exc.status_code} for WhoAmI against {org_url}."
@@ -316,7 +363,10 @@ def _success_detail(org_url: str, auth_mode: str) -> str:
 
 
 async def _run_verification(
-    resolver: CrmCredentialResolver, tenant_slug: str, auth_mode: str
+    resolver: CrmCredentialResolver,
+    tenant_slug: str,
+    auth_mode: str,
+    client_id_secret_name: str | None = None,
 ) -> tuple[bool, str]:
     """The check itself: a D365 ``WhoAmI``, preceded by the vault hop in
     ``key_vault`` mode. Every failure is an answer — this returns
@@ -338,7 +388,9 @@ async def _run_verification(
     try:
         await connector.who_am_i()
     except ConnectorError as exc:
-        return False, _d365_failure_detail(exc, connector.org_url, auth_mode)
+        return False, _d365_failure_detail(
+            exc, connector.org_url, auth_mode, client_id_secret_name
+        )
     return True, _success_detail(connector.org_url, auth_mode)
 
 
@@ -371,15 +423,15 @@ async def verify_credentials(
             )
         # Which mode this tenant is in decides how the outcome is phrased —
         # the check itself is the resolver's business, not this route's.
-        auth_mode = (
-            KEY_VAULT_AUTH_MODE
-            if isinstance(credentials, ResolvedKvCredentials)
-            else DIRECT_AUTH_MODE
-        )
+        is_vault = isinstance(credentials, ResolvedKvCredentials)
+        auth_mode = KEY_VAULT_AUTH_MODE if is_vault else DIRECT_AUTH_MODE
+        # Name this tenant's own secret, not a literal.
+        client_id_secret_name = credentials.client_id_secret_name if is_vault else None
         resolver = CrmCredentialResolver(store, cache)
         try:
             ok, detail = await asyncio.wait_for(
-                _run_verification(resolver, tenant_slug, auth_mode), VERIFY_TIMEOUT_SECONDS
+                _run_verification(resolver, tenant_slug, auth_mode, client_id_secret_name),
+                VERIFY_TIMEOUT_SECONDS,
             )
         except TimeoutError:
             waited_on = "Key Vault or D365" if auth_mode == KEY_VAULT_AUTH_MODE else "D365"
@@ -404,7 +456,8 @@ class CustomApiCredentialsIn(BaseModel):
     ``direct`` (the default): the credentials given are the SSP Basic Auth
     pair, stored here encrypted. ``key_vault``: the credentials given are
     a *vault reader's*, and the SSP pair is read from that vault at call
-    time (``Ssp-User-Id``/``Ssp-Password``), never stored here — prefer it
+    time, under the secret names registered alongside it, never stored
+    here — prefer it
     whenever a tenant can offer a vault.
 
     ``direct`` is the default (where ``D365CredentialsIn`` defaults to
@@ -443,6 +496,22 @@ class CustomApiCredentialsIn(BaseModel):
     )
     kv_client_secret: str | None = Field(
         default=None, description="key_vault mode only. That app registration's client secret."
+    )
+    kv_secret_name_username: str | None = Field(
+        default=None,
+        pattern=SECRET_NAME_PATTERN,
+        description=(
+            "key_vault mode: REQUIRED. What this tenant's vault calls the secret holding the "
+            "SSP username."
+        ),
+    )
+    kv_secret_name_password: str | None = Field(
+        default=None,
+        pattern=SECRET_NAME_PATTERN,
+        description=(
+            "key_vault mode: REQUIRED. What this tenant's vault calls the secret holding the "
+            "SSP password."
+        ),
     )
 
     @model_validator(mode="after")
@@ -486,6 +555,8 @@ async def upsert_custom_api_credentials(
                 kv_vault_url=str(body.kv_vault_url) if body.kv_vault_url else None,
                 kv_client_id=body.kv_client_id,
                 kv_client_secret=body.kv_client_secret,
+                kv_secret_name_username=body.kv_secret_name_username,
+                kv_secret_name_password=body.kv_secret_name_password,
             ),
         )
         redacted = await store.get_redacted(tenant_slug)
@@ -572,23 +643,31 @@ def _is_ssp_auth_rejection(exc: SspConnectorError) -> bool:
     return _SSP_AUTH_MARKER in (exc.body or "").casefold()
 
 
-def _ssp_failure_detail(exc: SspConnectorError, *, probed: bool, auth_mode: str) -> tuple[bool, str]:
+def _ssp_failure_detail(
+    exc: SspConnectorError,
+    *,
+    probed: bool,
+    auth_mode: str,
+    secret_names: tuple[str, str] | None = None,
+) -> tuple[bool, str]:
     """``(ok, detail)`` for a failed SSP call.
 
     A rejected credential is the one case this check can attribute with
     certainty, and the wording differs by mode: in ``key_vault`` mode the
-    rejected pair is the one the vault handed back
-    (``Ssp-User-Id``/``Ssp-Password``), not anything registered here, so
-    naming the registered fields would send an admin to the wrong place.
+    rejected pair is the one the vault handed back, not anything registered
+    here, so naming the registered fields would send an admin to the wrong
+    place. ``secret_names`` is that tenant's own pair — named rather than
+    assumed, since two tenants' vaults need not spell them alike.
 
     Everything else stays inconclusive rather than being called a credential
     failure — guessing would send an admin rotating a secret that was fine.
     """
     if _is_ssp_auth_rejection(exc):
         if auth_mode == KEY_VAULT_AUTH_MODE:
+            named = f"{secret_names[0]}/{secret_names[1]}" if secret_names else "the SSP"
             return False, (
                 "The SSP API rejected the credentials read from Key Vault — check the "
-                "Ssp-User-Id/Ssp-Password secrets in the vault are current."
+                f"{named} secrets in the vault are current."
             )
         return False, (
             "The SSP API rejected the registered credentials — check the registered "
@@ -652,15 +731,20 @@ async def verify_custom_api_credentials(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="no credentials registered"
             )
-        auth_mode = (
-            KEY_VAULT_AUTH_MODE
-            if isinstance(credentials, ResolvedKvCustomApiCredentials)
-            else DIRECT_AUTH_MODE
+        is_vault = isinstance(credentials, ResolvedKvCustomApiCredentials)
+        auth_mode = KEY_VAULT_AUTH_MODE if is_vault else DIRECT_AUTH_MODE
+        # Name this tenant's own secrets, not a literal.
+        secret_names = (
+            (credentials.username_secret_name, credentials.password_secret_name)
+            if is_vault
+            else None
         )
         resolver = SspCredentialResolver(store, cache)
         try:
             ok, detail = await asyncio.wait_for(
-                _run_ssp_verification(resolver, tenant_slug, account_number, probed, auth_mode),
+                _run_ssp_verification(
+                    resolver, tenant_slug, account_number, probed, auth_mode, secret_names
+                ),
                 VERIFY_TIMEOUT_SECONDS,
             )
         except TimeoutError:
@@ -683,6 +767,7 @@ async def _run_ssp_verification(
     account_number: str,
     probed: bool,
     auth_mode: str,
+    secret_names: tuple[str, str] | None = None,
 ) -> tuple[bool, str]:
     """The check itself: a read-only ``feewaiver`` lookup, preceded by the
     vault hop in ``key_vault`` mode. Never raises for a credential or
@@ -700,7 +785,9 @@ async def _run_ssp_verification(
     try:
         await client.verify_access(account_number)
     except SspConnectorError as exc:
-        return _ssp_failure_detail(exc, probed=probed, auth_mode=auth_mode)
+        return _ssp_failure_detail(
+            exc, probed=probed, auth_mode=auth_mode, secret_names=secret_names
+        )
     if probed:
         return True, (
             "The SSP API accepted the credentials and answered the probe lookup"

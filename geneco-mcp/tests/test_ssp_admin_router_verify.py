@@ -71,6 +71,8 @@ def _seed_key_vault(ssp_client: TestClient, tenant_slug: str = "geneco") -> None
             "kv_vault_url": KV_URL,
             "kv_client_id": "kv1",
             "kv_client_secret": "kv-secret",
+            "kv_secret_name_username": "Ssp-User-Id",
+            "kv_secret_name_password": "Ssp-Password",
         },
     )
     assert resp.status_code == 200

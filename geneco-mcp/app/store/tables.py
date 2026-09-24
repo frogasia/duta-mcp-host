@@ -43,8 +43,8 @@ class D365Credential(Base):
 
     ``key_vault`` (the default, and the one to prefer): the stored
     credential is the tenant's *Key Vault* app registration. The D365 app
-    registration (``Crm-Client-Id``/``Crm-Client-Secret``) lives in that
-    vault and is fetched at call time — see ``clients/keyvault_client.py``
+    registration lives in that vault, under the secret names this row
+    carries, and is fetched at call time — see ``clients/keyvault_client.py``
     — so it is never at rest here.
 
     ``direct``: the tenant has no vault, so ``client_id``/
@@ -80,6 +80,13 @@ class D365Credential(Base):
     kv_client_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     #: Fernet ciphertext — see ``security/crypto.py``. Never stored plaintext.
     kv_client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: ``key_vault`` mode only, REQUIRED there: what this tenant's vault
+    #: calls the two secrets holding the D365 app registration. No default
+    #: — a row without them is unusable, not guessed at. Nullable only
+    #: because a ``direct`` row has no vault. Names, not secrets: stored
+    #: plain and echoed on read paths.
+    kv_secret_name_client_id: Mapped[str | None] = mapped_column(String(127), nullable=True)
+    kv_secret_name_client_secret: Mapped[str | None] = mapped_column(String(127), nullable=True)
     #: ``direct`` mode only — NULL on a ``key_vault`` row. This is the D365
     #: app registration itself, not a vault reader.
     client_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -102,7 +109,7 @@ class CustomApiCredential(Base):
 
     ``direct`` (the default): the Basic Auth pair is stored here
     encrypted. ``key_vault``: only a vault-READER app lives here, and the
-    SSP user id/password (``Ssp-User-Id``/``Ssp-Password``) are fetched
+    SSP user id/password are fetched, under the names this row carries,
     from the tenant's vault at call time — see ``store/ssp_resolver.py``.
 
     Mirrors ``D365Credential``'s two-mode shape, with one difference that
@@ -133,6 +140,11 @@ class CustomApiCredential(Base):
     kv_client_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     #: Fernet ciphertext — see ``security/crypto.py``. Never stored plaintext.
     kv_client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: ``key_vault`` mode only, and REQUIRED there: what this tenant's
+    #: vault calls the two secrets holding the SSP Basic Auth pair. No
+    #: default, for the same reason as on ``D365Credential``.
+    kv_secret_name_username: Mapped[str | None] = mapped_column(String(127), nullable=True)
+    kv_secret_name_password: Mapped[str | None] = mapped_column(String(127), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow

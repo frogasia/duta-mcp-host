@@ -85,6 +85,8 @@ def test_crm_and_ssp_credentials_are_independent(
         "kv_vault_url": "https://geneco-kv.vault.azure.net",
         "kv_client_id": "77fa3ab9-8247-48e4-8ad5-5fc959ef7f24",
         "kv_client_secret": "d365-secret",
+        "kv_secret_name_client_id": "Crm-Client-Id",
+        "kv_secret_name_client_secret": "Crm-Client-Secret",
     }
     crm_client.post(
         "/geneco/credentials", headers={"X-Admin-Api-Key": TEST_ADMIN_API_KEY}, json=d365_body
@@ -137,6 +139,8 @@ KV_BODY = {
     "kv_vault_url": "https://geneco-kv.vault.azure.net",
     "kv_client_id": "kv-app-id",
     "kv_client_secret": "kv-super-secret-value",
+    "kv_secret_name_username": "Ssp-User-Id",
+    "kv_secret_name_password": "Ssp-Password",
 }
 AUTH = {"X-Admin-Api-Key": TEST_ADMIN_API_KEY}
 
@@ -256,9 +260,17 @@ def test_a_400_that_is_not_an_auth_failure_stays_inconclusive():
 
 
 def test_key_vault_mode_names_the_vault_secrets_not_the_registered_fields():
+    """And names *this tenant's* secrets — the pair is per-tenant now, so a
+    message naming a fixed pair would send some admins to the wrong place."""
     from geneco_mcp.clients.custom_api_client import ConnectorError
     from geneco_mcp.protocol.admin_router import _ssp_failure_detail
 
     rejected = ConnectorError("x", status_code=400, body='{"errordescription":"Unauthorized request"}')
-    _, detail = _ssp_failure_detail(rejected, probed=True, auth_mode="key_vault")
-    assert "Ssp-User-Id/Ssp-Password" in detail
+    _, detail = _ssp_failure_detail(
+        rejected,
+        probed=True,
+        auth_mode="key_vault",
+        secret_names=("Vendor-Api-User", "Vendor-Api-Pass"),
+    )
+    assert "Vendor-Api-User/Vendor-Api-Pass" in detail
+    assert "username" not in detail

@@ -68,6 +68,8 @@ def _seed_credentials(mcp: TestClient, tenant_slug: str) -> None:
             "kv_vault_url": KV_URL,
             "kv_client_id": "kv1",
             "kv_client_secret": "kvs1",
+            "kv_secret_name_client_id": "Crm-Client-Id",
+            "kv_secret_name_client_secret": "Crm-Client-Secret",
         },
     )
     assert resp.status_code == 200

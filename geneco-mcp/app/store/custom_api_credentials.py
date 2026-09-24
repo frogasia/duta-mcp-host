@@ -53,6 +53,11 @@ class CustomApiCredentialsInput:
     kv_vault_url: str | None = None
     kv_client_id: str | None = None
     kv_client_secret: str | None = None
+    #: What this tenant's vault calls the two secrets holding the SSP
+    #: Basic Auth pair. Required in ``key_vault`` mode (enforced at the
+    #: intake boundary); optional here only for ``direct`` rows.
+    kv_secret_name_username: str | None = None
+    kv_secret_name_password: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,13 +74,18 @@ class ResolvedDirectCustomApiCredentials:
 class ResolvedKvCustomApiCredentials:
     """Decrypted vault-reader credentials plus the SSP base URL they
     unlock. ``client_id``/``client_secret`` here are the *vault reader's*
-    — the SSP pair is what reading the vault produces."""
+    — the SSP pair is what reading the vault produces.
+
+    The two ``*_secret_name`` fields are never ``None`` — a row that does
+    not carry them is not usable in this mode at all."""
 
     base_url: str
     tenant_id: str
     vault_url: str
     client_id: str
     client_secret: str
+    username_secret_name: str
+    password_secret_name: str
 
 
 def _has_usable_pair(row: CustomApiCredential) -> bool:
@@ -90,6 +100,10 @@ def _has_usable_pair(row: CustomApiCredential) -> bool:
         and row.kv_vault_url is not None
         and row.kv_client_id is not None
         and row.kv_client_secret_encrypted is not None
+        # Without the names there is nothing to ask the vault for — see
+        # the same guard in ``store/credentials.py``.
+        and row.kv_secret_name_username is not None
+        and row.kv_secret_name_password is not None
     )
 
 
@@ -118,6 +132,8 @@ class CustomApiCredentialStore:
             row.kv_vault_url = None
             row.kv_client_id = None
             row.kv_client_secret_encrypted = None
+            row.kv_secret_name_username = None
+            row.kv_secret_name_password = None
         else:
             assert config.kv_client_secret is not None
             row.tenant_id = config.tenant_id
@@ -126,6 +142,8 @@ class CustomApiCredentialStore:
             row.kv_client_secret_encrypted = encrypt_secret(
                 config.kv_client_secret, key=self._encryption_key
             )
+            row.kv_secret_name_username = config.kv_secret_name_username
+            row.kv_secret_name_password = config.kv_secret_name_password
             row.username = None
             row.password_encrypted = None
         row.enabled = True
@@ -161,6 +179,8 @@ class CustomApiCredentialStore:
             redacted["kv_vault_url"] = row.kv_vault_url
             redacted["kv_client_id"] = row.kv_client_id
             redacted["kv_client_secret"] = MASK
+            redacted["kv_secret_name_username"] = row.kv_secret_name_username
+            redacted["kv_secret_name_password"] = row.kv_secret_name_password
         redacted["enabled"] = row.enabled
         return redacted
 
@@ -209,6 +229,8 @@ class CustomApiCredentialStore:
             )
         assert row.tenant_id is not None and row.kv_vault_url is not None
         assert row.kv_client_id is not None and row.kv_client_secret_encrypted is not None
+        assert row.kv_secret_name_username is not None
+        assert row.kv_secret_name_password is not None
         return ResolvedKvCustomApiCredentials(
             base_url=row.base_url,
             tenant_id=row.tenant_id,
@@ -217,4 +239,6 @@ class CustomApiCredentialStore:
             client_secret=decrypt_secret(
                 row.kv_client_secret_encrypted, key=self._encryption_key
             ),
+            username_secret_name=row.kv_secret_name_username,
+            password_secret_name=row.kv_secret_name_password,
         )
