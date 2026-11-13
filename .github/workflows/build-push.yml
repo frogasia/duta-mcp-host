@@ -1,0 +1,130 @@
+name: build-push
+
+# Test, build and push the gateway image to the shared ECR, then deploy to dev.
+# Tags are `dev-<sha7>-<run_id>`, images are linux/arm64 (es-dev-cluster
+# nodes), and "deploy" means committing the new tag into
+# enterprise-solution-helm's values.dev.yaml, which ArgoCD app
+# dev-duta-mcp-host auto-syncs.
+#
+# Required repo config:
+#   vars.ES_CI_AWS_REGION        ap-southeast-5
+#   vars.ES_CI_AWS_ASSUME_ROLE   role in 275755767383 with ECR push on duta-ilmu-*
+#                                (its OIDC trust must also list THIS repo)
+#   secrets.HELM_DEPLOYMENT_KEY  deploy key with write access to enterprise-solution-helm
+#
+# Pull requests only run the tests and the build. Nothing is pushed or deployed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  IMAGE: 275755767383.dkr.ecr.ap-southeast-5.amazonaws.com/duta-ilmu-mcp-host
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # geneco-mcp detached:
+      # - name: Install
+      #   working-directory: geneco-mcp
+      #   run: pip install -e ../shared -e ".[dev]"
+      # - name: pytest (SQLite + respx — no services needed)
+      #   working-directory: geneco-mcp
+      #   run: pytest -q
+      - name: Install ytllead-mcp
+        working-directory: ytllead-mcp
+        run: pip install -e ../shared -e ".[dev]"
+      - name: pytest ytllead-mcp (respx — no services needed)
+        working-directory: ytllead-mcp
+        run: pytest -q
+
+  build-push:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        run: echo "tag=dev-${GITHUB_SHA::7}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name != 'pull_request'
+        with:
+          role-to-assume: arn:aws:iam::275755767383:role/${{ vars.ES_CI_AWS_ASSUME_ROLE }}
+          aws-region: ${{ vars.ES_CI_AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        if: github.event_name != 'pull_request'
+
+      - name: Build and push
+        run: |
+          set -euo pipefail
+          docker build -t "$IMAGE:${{ steps.tag.outputs.tag }}" .
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            docker push "$IMAGE:${{ steps.tag.outputs.tag }}"
+          else
+            echo "PR build-only: skipped push"
+          fi
+
+  deploy-helm:
+    needs: build-push
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      # Shared with other repos' deploys, so no two ever push to the helm repo at once.
+      group: deploy-helm-enterprise-solution-helm-dev
+      cancel-in-progress: false
+    steps:
+      - name: Checkout helm repo (deploy key)
+        env:
+          HELM_DEPLOYMENT_KEY: ${{ secrets.HELM_DEPLOYMENT_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$HELM_DEPLOYMENT_KEY" > ~/.ssh/helm_deploy_key
+          chmod 600 ~/.ssh/helm_deploy_key
+          printf 'Host github.com\n  IdentityFile ~/.ssh/helm_deploy_key\n' > ~/.ssh/config
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git clone --depth 1 git@github.com:frogasia/enterprise-solution-helm.git helm
+
+      - name: Bump image.tag
+        working-directory: helm
+        run: |
+          set -euo pipefail
+          VALUES="enterprise-solution/charts/duta-mcp-host/values.dev.yaml"
+          TAG="${{ needs.build-push.outputs.tag }}"
+          # values.dev.yaml has exactly one `tag:` key (image.tag); sed avoids downloading
+          # a tool into the job that holds the deploy key.
+          [ "$(grep -c '^  tag: ' "$VALUES")" -eq 1 ] || { echo "expected exactly one tag: line" >&2; exit 1; }
+          sed -i -E "s|^(  tag: ).*|\1\"$TAG\"|" "$VALUES"
+          grep -q "^  tag: \"$TAG\"$" "$VALUES"
+          git config user.name "duta-mcp-host-ci"
+          git config user.email "ci@duta-mcp-host.local"
+          git add "$VALUES"
+          git commit -m "Update duta-mcp-host image tag to $TAG for dev environment" --no-verify
+          # Other repos push to this helm repo too; concurrency groups don't span repos.
+          for attempt in 1 2 3; do
+            git push origin main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1

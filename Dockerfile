@@ -7,8 +7,10 @@ COPY shared/ ./shared/
 RUN pip install --no-cache-dir -e ./shared
 
 # Install sub-projects (installs their deps) + gateway deps
-COPY geneco-mcp/ ./geneco-mcp/
-RUN pip install --no-cache-dir -e ./geneco-mcp \
+# geneco-mcp detached — to restore, uncomment and add `-e ./geneco-mcp` below:
+# COPY geneco-mcp/ ./geneco-mcp/
+COPY ytllead-mcp/ ./ytllead-mcp/
+RUN pip install --no-cache-dir -e ./ytllead-mcp \
     "fastapi>=0.115.0" \
     "uvicorn[standard]>=0.34.0"
 
@@ -25,6 +27,4 @@ USER appuser
 
 EXPOSE 8000
 
-# Runs geneco-mcp's `alembic upgrade head` before starting uvicorn — this
-# service now owns its own Postgres-backed credential store.
 CMD ["./docker-entrypoint.sh"]

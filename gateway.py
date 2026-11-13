@@ -9,11 +9,10 @@ Adding a new sub-app:
     2. Append a ``SubApp(...)`` entry to ``SUB_APPS``.
 Nothing else in this module should need to change.
 
-geneco-mcp mounts twice, once per backend it fronts, so a tenant onboarded
-to D365 weeks before the self-service portal (or the other way round) has
-one connector to register now and the other later. Same codebase and same
-database both times — only the tool set and the credential-intake body
-differ, picked by ``kind`` (see ``geneco_mcp/main.py``).
+Only ytllead-mcp is mounted. The geneco-mcp mounts are commented out
+(detached, not deleted): uncomment its imports and ``SubApp`` entries, and
+the matching lines in the Dockerfile, docker-entrypoint.sh,
+docker-compose.yml, Makefile, requirements.txt and CI, to bring it back.
 """
 
 from __future__ import annotations
@@ -24,10 +23,13 @@ from dataclasses import dataclass
 
 import structlog
 from duta_mcp_shared.observability import configure_logging
-from geneco_mcp.config import Settings as GenecoMcpSettings
-from geneco_mcp.main import create_app as create_geneco_mcp
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from ytllead_mcp.config import Settings as YtlleadMcpSettings
+from ytllead_mcp.main import create_app as create_ytllead_mcp
+
+# geneco-mcp detached:
+# from geneco_mcp.main import create_app as create_geneco_mcp
 
 GATEWAY_SERVICE = "duta-mcp-host"
 
@@ -46,15 +48,21 @@ class SubApp:
 
 
 SUB_APPS: tuple[SubApp, ...] = (
+    # geneco-mcp detached:
+    # SubApp(
+    #     name="geneco-crm-mcp",
+    #     path_prefix="/geneco-crm-mcp",
+    #     app=create_geneco_mcp(kind="crm"),
+    # ),
+    # SubApp(
+    #     name="geneco-ssp-mcp",
+    #     path_prefix="/geneco-ssp-mcp",
+    #     app=create_geneco_mcp(kind="ssp"),
+    # ),
     SubApp(
-        name="geneco-crm-mcp",
-        path_prefix="/geneco-crm-mcp",
-        app=create_geneco_mcp(kind="crm"),
-    ),
-    SubApp(
-        name="geneco-ssp-mcp",
-        path_prefix="/geneco-ssp-mcp",
-        app=create_geneco_mcp(kind="ssp"),
+        name="ytllead-mcp",
+        path_prefix="/ytllead-mcp",
+        app=create_ytllead_mcp(),
     ),
 )
 
@@ -68,14 +76,14 @@ def _service_for_path(path: str) -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Configure the process-wide structured logging pipeline BEFORE any
-    # sub-app lifespan runs. Sub-apps share the same pipeline.
-    geneco_mcp_settings = GenecoMcpSettings()
+    # Configure logging BEFORE any sub-app lifespan runs; all sub-apps share
+    # it. Level/format/env come from YTLLEAD_MCP_LOG_* / YTLLEAD_MCP_ENV.
+    logging_settings = YtlleadMcpSettings()
     configure_logging(
-        log_level=geneco_mcp_settings.log_level,
-        log_format=geneco_mcp_settings.log_format,  # type: ignore[arg-type]
+        log_level=logging_settings.log_level,
+        log_format=logging_settings.log_format,  # type: ignore[arg-type]
         service=GATEWAY_SERVICE,
-        env=geneco_mcp_settings.env,
+        env=logging_settings.env,
     )
 
     # Starlette does not propagate lifespan events to mounted sub-apps.

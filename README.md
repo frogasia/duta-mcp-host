@@ -13,6 +13,7 @@ different times and each connector should be registerable on its own:
 |---|---|---|
 | `/geneco-crm-mcp` | D365/Dataverse | account inquiry, create case, case inquiry |
 | `/geneco-ssp-mcp` | Geneco's self-service portal (custom cxchat API) | fee waiver, re-contract eligibility, fee reversal, password reset |
+| `/ytllead-mcp` | YTL LEAD conference app API | the signed-in user's own LEAD profile — see [`ytllead-mcp/README.md`](ytllead-mcp/README.md) |
 
 Both are consumed by duta-ilmu's orchestrator (its MCP client already exists — see
 `services/orchestrator/src/orchestrator/tools/mcp.py` in the `duta-ilmu`
@@ -57,6 +58,7 @@ duta-mcp-host/
     │   └── protocol/         # MCP JSON-RPC (router.py) + credential intake (admin_router.py)
     ├── tests/
     └── pyproject.toml
+└── ytllead-mcp/               # One MCP server over the YTL LEAD user-info API (no DB; env-prefixed YTLLEAD_MCP_)
 ```
 
 ## How It Works
