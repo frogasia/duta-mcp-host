@@ -1,15 +1,17 @@
 name: build-push
 
-# Test, build and push the gateway image to the shared ECR, then deploy to dev.
-# Tags are `dev-<sha7>-<run_id>`, images are linux/arm64 (es-dev-cluster
-# nodes), and "deploy" means committing the new tag into
-# enterprise-solution-helm's values.dev.yaml, which ArgoCD app
-# dev-duta-mcp-host auto-syncs.
+# Test, build and push the gateway image to the central ECR, then deploy to dev.
+# Tags are `<sha7>-<run_id>` (immutable repo: a "Re-run" of the same run reuses
+# the tag and is rejected; start a new run instead). Images are linux/arm64
+# (es-dev-cluster nodes), and "deploy" means committing the new tag into
+# enterprise-solution-helm's charts/duta-mcp-host/values.dev.yaml, which the
+# Argo CD dev app auto-syncs.
 #
-# Required repo config:
-#   vars.ES_CI_AWS_REGION        ap-southeast-5
-#   vars.ES_CI_AWS_ASSUME_ROLE   role in 275755767383 with ECR push on duta-ilmu-*
-#                                (its OIDC trust must also list THIS repo)
+# Required repo config (set 2026-11-13):
+#   vars.DUTA_ECR_REGISTRY       800557027614.dkr.ecr.ap-southeast-5.amazonaws.com
+#   vars.DUTA_ECR_PUSH_ROLE_ARN  arn:aws:iam::800557027614:role/github-actions-central
+#                                (trusts repo:frogasia/*; push policy lists the
+#                                duta-ilmu-mcp-host repo)
 #   secrets.HELM_DEPLOYMENT_KEY  deploy key with write access to enterprise-solution-helm
 #
 # Pull requests only run the tests and the build. Nothing is pushed or deployed.
@@ -30,7 +32,8 @@ permissions:
   contents: read
 
 env:
-  IMAGE: 275755767383.dkr.ecr.ap-southeast-5.amazonaws.com/duta-ilmu-mcp-host
+  AWS_REGION: ap-southeast-5
+  IMAGE: ${{ vars.DUTA_ECR_REGISTRY }}/duta-ilmu-mcp-host
 
 jobs:
   test:
@@ -65,13 +68,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - id: tag
-        run: echo "tag=dev-${GITHUB_SHA::7}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${GITHUB_SHA::7}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         if: github.event_name != 'pull_request'
         with:
-          role-to-assume: arn:aws:iam::275755767383:role/${{ vars.ES_CI_AWS_ASSUME_ROLE }}
-          aws-region: ${{ vars.ES_CI_AWS_REGION }}
+          role-to-assume: ${{ vars.DUTA_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - uses: aws-actions/amazon-ecr-login@v2
         if: github.event_name != 'pull_request'
