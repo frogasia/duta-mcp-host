@@ -1,0 +1,37 @@
+[project]
+name = "ytllead-mcp"
+version = "0.1.0"
+description = "MCP server exposing the YTL LEAD conference app's user-info API."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "pyjwt>=2.8",
+    "duta-mcp-shared",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ytllead_mcp"]
+package-dir = { ytllead_mcp = "app" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff.lint.isort]
+known-first-party = ["ytllead_mcp"]
+
+[tool.ruff]
+line-length = 100
