@@ -14,13 +14,13 @@ https://<host>/ytllead-mcp/mcp
 | `get_my_lead_profile` | none | `GET /api/v1/app/users/info?id=<verified user id>` |
 
 The tool returns the record as **Markdown**, not JSON (`app/render.py`).
-Sections: personal details, attendance and registration, LEAD event, pre-conference tour,
-workshop team, and personality profile with its suggested agenda.
+Sections: personal details, attendance and registration, event (each workshop
+nested in its event, with room, venue, time and team), pre-conference tour, and
+personality profile with its tips for each part of the conference.
 
 - **No schema.** LEAD publishes none. The renderer was checked against every
   record in ids 1–550 (475 users, Nov 2026). Known fields get named sections.
-  Any other field, including ones never seen populated (`workshop_teams`,
-  `speakers`), is rendered by a generic fallback, so new data shows up instead
+  Any other field, including ones never seen populated (`speakers`), is rendered by a generic fallback, so new data shows up instead
   of being dropped. If a field arrives in an unexpected shape, the call answers
   "can't reach LEAD" rather than failing.
 - **Left out on purpose:** database plumbing (ids, pivots, image paths,
