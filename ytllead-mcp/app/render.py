@@ -2,7 +2,7 @@
 
 LEAD publishes no schema; this follows the shape of the real records.
 Known fields get named sections. Anything else (a new field, or one never
-seen populated like ``workshop_teams``/``speakers``) goes through
+seen populated like ``speakers``) goes through
 ``_fields``, so new data shows up instead of being dropped.
 
 Left out on purpose: database plumbing (ids, pivots, image paths, colours),
@@ -119,19 +119,41 @@ def _done(value: Any) -> str:
     return f"done ({_when(value)})" if value and ISO.match(str(value)) else "not yet"
 
 
+def _places(locations: Any) -> list[str]:
+    if isinstance(locations, dict):
+        locations = [locations]
+    return [
+        loc["name"] + (f" ({loc['address']})" if loc.get("address") else "")
+        for loc in locations or []
+        if isinstance(loc, dict) and isinstance(loc.get("name"), str) and loc["name"]
+    ]
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
 def _event(e: dict[str, Any]) -> list[str]:
     out = [f"### {e.get('title') or 'Event'}"]
     if e.get("start_at"):
         out.append(f"- When: {_span(e['start_at'], e.get('end_at'))}")
-    places = [
-        loc["name"] + (f" ({loc['address']})" if loc.get("address") else "")
-        for loc in e.get("locations") or []
-        if loc.get("name")
-    ]
+    places = _places(e.get("locations"))
+    raw = e.get("workshop_teams")
+    teams = [wt for wt in ([raw] if isinstance(raw, dict) else raw or []) if isinstance(wt, dict)]
     if len(places) == 1:
         out.append(f"- Where: {places[0]}")
     elif places:  # the data doesn't say which venue applies to this user
         out.append("- Where (listed venues, data doesn't say which): " + "; ".join(places))
+    elif "workshop_teams" in e and not teams:  # BUILD, no team yet: say so, don't leave a gap
+        out.append("- Where: not in the record yet (no workshop team or room assigned)")
+    elif not teams:  # with teams, each workshop below carries its own room and venue
+        out.append("- Where: not in the record")
+    for wt in teams:
+        out.extend(_workshop(wt, e))
     speakers = _fields(e.get("speakers") or [], indent=1)
     out.append("- Speakers:" if speakers else "- Speakers: none listed")
     out.extend(speakers)
@@ -145,10 +167,55 @@ def _event(e: dict[str, Any]) -> list[str]:
         "description",
         "is_active",
         "is_ready",
+        "capacity",
+        "workshop_teams",
     }
     out.extend(_fields(e, skip))
     if e.get("description"):
         out += ["", _text(e["description"])]
+    return out
+
+
+def _workshop(wt: dict[str, Any], event: dict[str, Any]) -> list[str]:
+    """One ``events[].workshop_teams[]`` item as a bullet nested in its event."""
+    w, team = _dict(wt.get("workshop")), _dict(wt.get("team"))
+    out = [f"- Workshop: {w.get('title') or 'title not in the record'}"]
+    room = w.get("sub_title")
+    if room:
+        out.append(f"  - Room: {room}")
+    places = _places(wt.get("location") or wt.get("locations"))
+    if places:
+        out.append("  - Where: " + "; ".join(places))
+    elif room:
+        out.append("  - Where: venue not in the record (only the room is listed)")
+    else:
+        out.append("  - Where: not in the record yet (no room assigned)")
+    if w.get("start_at"):
+        when = _span(w["start_at"], w.get("end_at"))
+        # compare rendered times (one moment spelled two ways isn't a clash); ends only if both
+        ends = (w.get("end_at"), event.get("end_at"))
+        clash = event.get("start_at") and (
+            _when(w["start_at"]) != _when(event["start_at"])
+            or (all(ends) and _when(ends[0]) != _when(ends[1]))
+        )
+        out.append(
+            f"  - Workshop time in the record: {when}"
+            + (
+                " (differs from the event time above; the data doesn't say which applies)"
+                if clash
+                else ""
+            )
+        )
+    if team.get("name"):
+        size = f"up to {team['capacity']} members" if team.get("capacity") else None
+        extra = ", ".join(filter(None, (team.get("team_code"), size)))
+        out.append(f"  - Your team: {team['name']}" + (f" ({extra})" if extra else ""))
+    out.extend(_fields(w, {"title", "sub_title", "start_at", "end_at", "description"}, indent=1))
+    out.extend(_fields(team, {"name", "team_code", "capacity"}, indent=1))
+    out.extend(_fields(wt, {"workshop", "team", "location", "locations"}, indent=1))
+    desc = w.get("description")
+    if desc and _text(desc) != _text(room or ""):  # LEAD repeats the room as the description
+        out.append(f"  - About: {_text(desc)}")
     return out
 
 
@@ -170,7 +237,8 @@ def _tour(t: dict[str, Any], selection_done: bool, only_row: bool = True) -> lis
     if session.get("date"):
         times = "–".join(filter(None, (_hhmm(t.get("start_time")), _hhmm(t.get("end_time")))))
         out.append(
-            f"- Date: {_when(session['date'], date_only=True)}" + (f", {times}" if times else "")
+            f"- Date: {_when(session['date'], date_only=True)}"
+            + (f", {times} MYT" if times else "")
         )
     if remark:  # "2nd Choice", "Same tour, different day", …: a preference note, not a status
         note = remark.strip()
@@ -190,7 +258,9 @@ def _tour(t: dict[str, Any], selection_done: bool, only_row: bool = True) -> lis
     out.append("- Meeting point: not in the record")
     out.extend(_fields(tour, {"title", "warning", "facility", "description"}))
     out.extend(_fields(session, {"date", "pre_conference_event"}))
-    out.extend(_fields(t, {"pre_conference_session", "start_time", "end_time", "pivot"}))
+    out.extend(
+        _fields(t, {"pre_conference_session", "start_time", "end_time", "pivot", "capacity"})
+    )
     if tour.get("description"):
         out += ["", _text(tour["description"])]
     return out
@@ -203,14 +273,18 @@ def _personality(up: dict[str, Any]) -> list[str]:
     out = [
         f"**{p.get('name') or 'Unknown'}**" + (f" — {p['sub_title']}" if p.get("sub_title") else "")
     ]
-    summary = _text(p.get("summary") or "")
-    in_summary = " ".join(summary.split())
+    # LEAD may open description/summary with the sub_title sentence (already in the header).
+    sub = _norm(str(p.get("sub_title") or ""))
+
+    def paras(key: str) -> list[str]:
+        return [
+            para for para in _text(p.get(key) or "").split("\n\n") if para and _norm(para) != sub
+        ]
+
+    summary = "\n\n".join(paras("summary"))
+    in_summary = _norm(summary)
     # LEAD repeats description paragraphs inside summary; keep only new ones.
-    fresh = [
-        para
-        for para in _text(p.get("description") or "").split("\n\n")
-        if para and " ".join(para.split()) not in in_summary
-    ]
+    fresh = [para for para in paras("description") if _norm(para) not in in_summary]
     out += [x for para in fresh for x in ("", para)]
     if summary:
         out += ["", summary]
@@ -229,7 +303,11 @@ def _personality(up: dict[str, Any]) -> list[str]:
         out += ["", f"Recommendation: {_text(p['recommendations'])}"]
     agenda = p.get("lead_agenda") or {}
     if agenda:
-        out += ["", "Suggested LEAD agenda:"]
+        out += [
+            "",
+            "Tips for each part of the conference "
+            "(advice for this personality type, not a schedule):",
+        ]
         for part, tips in agenda.items():
             out.append(f"- {_label(part)}:")
             out.extend(f"  - {_text(tip)}" for tip in (tips if isinstance(tips, list) else [tips]))
@@ -259,12 +337,12 @@ def to_markdown(data: dict[str, Any]) -> str:
     phone = " ".join(filter(None, (prof.get("phone_country_code"), prof.get("phone_number"))))
     dob = prof.get("dob") if prof.get("dob") not in (None, "", PLACEHOLDER_DOB) else "not provided"
     out = [
-        f"# YTL LEAD profile: {name}",
+        f"# Conference profile: {name}",
         "",
         "This is the signed-in user's own record. All times are Malaysia time (MYT).",
         "",
         "## Personal details",
-        f"- LEAD user ID: {data.get('id')}",
+        f"- User ID: {data.get('id')}",
         f"- Name: {name}",
         f"- Designation: {prof.get('designation') or 'not provided'}",
         f"- Company: {company or 'not provided'}",
@@ -305,7 +383,7 @@ def to_markdown(data: dict[str, Any]) -> str:
         "",
         "## Attendance and registration",
         f"- Registration completed: {_yes(data.get('is_registration_completed'))}",
-        f"- Attending LEAD: {attending}",
+        f"- Attending the conference: {attending}",
         f"- Table number: {prof.get('table_no') or 'not assigned yet'}",
         f"- Personality quiz: {_done(prof.get('is_personality_completed'))}",
         f"- Activity selection: {_done(prof.get('is_activity_completed'))}",
@@ -335,7 +413,8 @@ def to_markdown(data: dict[str, Any]) -> str:
         notes = []
         if not_attending:
             notes.append(
-                "- Note: marked as not attending LEAD, so the selection below may no longer apply."
+                "- Note: marked as not attending the conference, "
+                "so the selection below may no longer apply."
             )
         if not step_done:
             notes.append(
@@ -344,14 +423,15 @@ def to_markdown(data: dict[str, Any]) -> str:
             )
         return notes
 
-    out += ["", "## LEAD event"]
-    raw_events = data.get("events") or []
-    events = list(
-        {
-            (e.get("id") if e.get("id") is not None else f"#{i}"): e
-            for i, e in enumerate(raw_events)
-        }.values()
-    )
+    out += ["", "## Event"]
+    by_id: dict[Any, dict[str, Any]] = {}
+    for i, e in enumerate(data.get("events") or []):
+        key = e.get("id") if e.get("id") is not None else f"#{i}"
+        prev = by_id.get(key)
+        if prev and prev.get("workshop_teams") and not e.get("workshop_teams"):
+            e = {**e, "workshop_teams": prev["workshop_teams"]}  # a duplicate must not drop a team
+        by_id[key] = e
+    events = list(by_id.values())
     if events:
         out += caveats(prof.get("is_activity_completed"), "activity selection")
     out += [line for e in events for line in [*_event(e), ""]] or ["- None registered", ""]
@@ -374,9 +454,10 @@ def to_markdown(data: dict[str, Any]) -> str:
             "",
         ]
 
-    out += ["## Workshop team"]
-    teams = _fields(data.get("workshop_teams") or [])
-    out += [*(teams or ["- Not assigned yet"]), ""]
+    legacy = _fields(data.get("workshop_teams") or [])  # pre-2026-11 shape: top-level list
+    if legacy:
+        caveat = caveats(prof.get("is_activity_completed"), "activity selection")
+        out += ["## Workshop team", *caveat, *legacy, ""]
 
     out += ["## Personality profile", *_personality(data.get("user_personality") or {})]
     return "\n".join(out).rstrip() + "\n"

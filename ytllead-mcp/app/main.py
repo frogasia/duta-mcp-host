@@ -34,13 +34,18 @@ TOOL_NAME = "get_my_lead_profile"
 TOOL = {
     "name": TOOL_NAME,
     "description": (
-        "Get the signed-in user's own YTL LEAD conference profile as Markdown: "
-        "personal details, attendance and registration progress, table number, "
-        "their LEAD event (when and where), pre-conference tour selection, "
-        "workshop team, and their personality profile with a suggested LEAD "
-        "agenda. All times are Malaysia time (MYT). Takes no arguments — it always "
-        "returns the record of the person signed in to this chat and cannot look "
-        "up anyone else."
+        "Use this whenever the user asks about their own conference plans: their "
+        "event, session, agenda, schedule, venue, room, time, tour, table, workshop, team, "
+        "registration or personality type, or where to go or what to do next "
+        '(e.g. "what is my event", "where should i go now", "event saya di mana"). '
+        "Call it before answering; don't answer from general knowledge or ask "
+        "them for details. Returns their record as Markdown: personal details, "
+        "attendance and registration progress, table number, their event "
+        "(date, time, venue, speakers), pre-conference tour selection, workshop "
+        "team, and their personality profile with tips for the day. Their "
+        "schedule is the event and tour. All times are Malaysia time (MYT). "
+        "Takes no arguments: it always returns the record of the person signed "
+        "in to this chat and cannot look up anyone else."
     ),
     "inputSchema": {"type": "object", "properties": {}},
 }

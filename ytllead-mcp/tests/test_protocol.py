@@ -30,7 +30,7 @@ def test_full_sequence_returns_signed_in_users_profile(client) -> None:
 
     result = call(client, identity(86))
     assert result["isError"] is False
-    assert "- LEAD user ID: 86" in result["text"]
+    assert "- User ID: 86" in result["text"]
     sent = route.calls.last.request
     assert sent.url.params["id"] == "86"
     assert sent.headers["Authorization"] == "Bearer test-token"
@@ -39,7 +39,7 @@ def test_full_sequence_returns_signed_in_users_profile(client) -> None:
 @respx.mock
 def test_id_in_arguments_is_ignored(client) -> None:
     route = respx.get(USER_INFO_URL).mock(return_value=ok(86))
-    assert "- LEAD user ID: 86" in call(client, identity(86), arguments={"id": 87})["text"]
+    assert "- User ID: 86" in call(client, identity(86), arguments={"id": 87})["text"]
     assert route.calls.last.request.url.params["id"] == "86"
 
 
